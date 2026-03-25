@@ -88,12 +88,14 @@ struct ipv4_nat_entry {
 
 struct ipv4_nat_target {
 	__be32 addr;
-	const __u16 min_port; /* host endianness */
-	const __u16 max_port; /* host endianness */
+	__u16 min_port; /* host endianness */
+	__u16 max_port; /* host endianness */
 	bool from_local_endpoint;
 	bool egress_gateway; /* NAT is needed because of an egress gateway policy */
-	__u32 cluster_id;
 	bool needs_ct;
+	__u8  egress_gw_owner_idx; /* HA: selected gateway index (0 or 1) */
+	__u32 cluster_id;
+	__be32 egress_gw_owner_ip; /* HA: selected gateway node IP */
 };
 
 #if defined(ENABLE_IPV4) && defined(ENABLE_NODEPORT)
@@ -224,6 +226,8 @@ static __always_inline int snat_v4_new_mapping(struct __ctx_buff *ctx, void *map
 	}
 
 	/* Loop completed without finding a free port: */
+	if (ext_err && target->egress_gateway)
+		*ext_err = (__s8)-(target->egress_gw_owner_idx + 1);
 	ret = DROP_NAT_NO_MAPPING;
 	goto out;
 
@@ -243,9 +247,16 @@ create_nat_entry:
 out:
 	/* We struggled to find a free port. Trigger GC in the agent to
 	 * free up any ports that are held by expired connections.
+	 *
+	 * For egress gateway HA, the per-gateway port range is halved,
+	 * so signal earlier to trigger GC before full exhaustion.
 	 */
-	if (retries > SNAT_SIGNAL_THRES)
+	if (target->egress_gateway) {
+		if (retries > SNAT_SIGNAL_THRES / 4)
+			send_signal_nat_fill_up(ctx, SIGNAL_PROTO_V4);
+	} else if (retries > SNAT_SIGNAL_THRES) {
 		send_signal_nat_fill_up(ctx, SIGNAL_PROTO_V4);
+	}
 
 	return ret;
 }
@@ -601,16 +612,40 @@ snat_v4_needs_masquerade(struct __ctx_buff *ctx __maybe_unused,
 	if (is_reply)
 		goto skip_egress_gateway;
 
-	if (egress_gw_snat_needed_hook(tuple->saddr, tuple->daddr, &target->addr)) {
-		if (target->addr == EGRESS_GATEWAY_NO_EGRESS_IP)
-			return DROP_NO_EGRESS_IP;
+	{
+		__be32 gw_ip0 = 0, gw_ip1 = 0;
 
-		target->egress_gateway = true;
-		/* If the endpoint is local, then the connection is already tracked. */
-		if (!local_ep)
-			target->needs_ct = true;
+		if (egress_gw_snat_needed_hook(tuple->saddr, tuple->daddr,
+					       &target->addr, &gw_ip0, &gw_ip1)) {
+			if (target->addr == EGRESS_GATEWAY_NO_EGRESS_IP)
+				return DROP_NO_EGRESS_IP;
 
-		return NAT_NEEDED;
+			target->egress_gateway = true;
+			/* If the endpoint is local, then the connection is already tracked. */
+			if (!local_ep)
+				target->needs_ct = true;
+
+			/* HA: each gateway always uses its own fixed SNAT
+			 * port range, determined by comparing the node's IP
+			 * against the two gateway slots. This prevents port
+			 * collisions during failover and recovery — a
+			 * gateway never uses ports reserved for the other.
+			 */
+			if (gw_ip1 != 0) {
+				if (IPV4_DIRECT_ROUTING == gw_ip0) {
+					target->egress_gw_owner_idx = 0;
+					target->min_port = EGRESS_GW_PORT_MIN_0;
+					target->max_port = EGRESS_GW_PORT_MAX_0;
+				} else {
+					target->egress_gw_owner_idx = 1;
+					target->min_port = EGRESS_GW_PORT_MIN_1;
+					target->max_port = EGRESS_GW_PORT_MAX_1;
+				}
+				target->egress_gw_owner_ip = IPV4_DIRECT_ROUTING;
+			}
+
+			return NAT_NEEDED;
+		}
 	}
 skip_egress_gateway:
 #endif

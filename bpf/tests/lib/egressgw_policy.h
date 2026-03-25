@@ -12,8 +12,9 @@ static __always_inline void add_egressgw_policy_entry(__be32 saddr, __be32 daddr
 	};
 
 	struct egress_gw_policy_entry in_val = {
-		.egress_ip  = egress_ip,
-		.gateway_ip = gateway_ip,
+		.egress_ip    = egress_ip,
+		.gateway_ip_0 = gateway_ip,
+		.gateway_ip_1 = 0,
 	};
 
 	map_update_elem(&EGRESS_POLICY_MAP, &in_key, &in_val, 0);

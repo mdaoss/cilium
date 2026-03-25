@@ -421,9 +421,11 @@ not_esp:
 #if defined(ENABLE_EGRESS_GATEWAY_COMMON)
 	{
 		__be32 snat_addr, daddr;
+		__be32 gw_ip0 = 0, gw_ip1 = 0;
 
 		daddr = ip4->daddr;
-		if (egress_gw_snat_needed_hook(ip4->saddr, daddr, &snat_addr)) {
+		if (egress_gw_snat_needed_hook(ip4->saddr, daddr, &snat_addr,
+					       &gw_ip0, &gw_ip1)) {
 			if (snat_addr == EGRESS_GATEWAY_NO_EGRESS_IP)
 				return DROP_NO_EGRESS_IP;
 
@@ -443,6 +445,24 @@ not_esp:
 				return DROP_INVALID;
 		}
 	}
+
+#ifdef ENABLE_EGRESS_GATEWAY
+	/* HA: reply packets redirected from the non-owner gateway arrive here
+	 * via tunnel with daddr still set to the egress IP. Check the reverse
+	 * map to identify such packets and tail-call into reverse SNAT.
+	 */
+	{
+		struct egress_gw_reverse_key rkey;
+
+		rkey.egress_ip = ip4->daddr;
+		if (map_lookup_elem(&cilium_egress_gw_reverse4, &rkey)) {
+			ctx_store_meta(ctx, CB_SRC_LABEL, *identity);
+			return tail_call_internal(ctx,
+						  CILIUM_CALL_IPV4_EGW_OVERLAY_REVSNAT,
+						  ext_err);
+		}
+	}
+#endif /* ENABLE_EGRESS_GATEWAY */
 #endif /* ENABLE_EGRESS_GATEWAY_COMMON */
 
 	/* Deliver to local (non-host) endpoint: */
@@ -463,6 +483,84 @@ not_esp:
 
 	return ipv4_host_delivery(ctx, ip4);
 }
+
+#if defined(ENABLE_EGRESS_GATEWAY_COMMON)
+/* Tail call: perform reverse SNAT on an egress gateway reply that arrived
+ * via tunnel from the non-owner gateway, then deliver to the local pod.
+ */
+__section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV4_EGW_OVERLAY_REVSNAT)
+int tail_handle_egw_overlay_revsnat(struct __ctx_buff *ctx)
+{
+	struct ipv4_nat_target target = {
+		.min_port = NODEPORT_PORT_MIN_NAT,
+		.max_port = NODEPORT_PORT_MAX_NAT,
+	};
+	struct trace_ctx trace = {
+		.reason = TRACE_REASON_CT_REPLY,
+		.monitor = 0,
+	};
+	__u32 src_id = ctx_load_and_clear_meta(ctx, CB_SRC_LABEL);
+	void *data, *data_end;
+	struct iphdr *ip4;
+	struct endpoint_info *ep;
+	__s8 ext_err = 0;
+	int ret;
+
+	ret = snat_v4_rev_nat(ctx, &target, &trace, &ext_err);
+	if (IS_ERR(ret)) {
+		if (ret == DROP_NAT_NO_MAPPING) {
+			/* No local SNAT mapping — this connection was SNAT'd by
+			 * the other gateway. Redirect via tunnel to the peer.
+			 */
+			struct egress_gw_reverse_key rkey;
+			struct egress_gw_reverse_val *rval;
+
+			if (!revalidate_data(ctx, &data, &data_end, &ip4))
+				goto drop_err;
+
+			rkey.egress_ip = ip4->daddr;
+			rval = map_lookup_elem(&cilium_egress_gw_reverse4, &rkey);
+			if (rval && rval->gateway_ip_1 != 0) {
+				__be32 other_gw;
+
+				/* Pick the gateway that is NOT this node */
+				if (rval->gateway_ip_0 == IPV4_DIRECT_ROUTING)
+					other_gw = rval->gateway_ip_1;
+				else
+					other_gw = rval->gateway_ip_0;
+
+				return __encap_and_redirect_with_nodeid(
+					ctx, 0, other_gw,
+					src_id, 0,
+					NOT_VTEP_DST, &trace);
+			}
+			goto to_host;
+		}
+		if (ret == NAT_PUNT_TO_STACK)
+			goto to_host;
+		goto drop_err;
+	}
+
+	if (!revalidate_data(ctx, &data, &data_end, &ip4))
+		return DROP_INVALID;
+
+	/* After rev SNAT, daddr is now the pod IP. Deliver locally. */
+	ep = lookup_ip4_endpoint(ip4);
+	if (ep && !(ep->flags & ENDPOINT_MASK_HOST_DELIVERY))
+		return ipv4_local_delivery(ctx, ETH_HLEN, src_id,
+					   MARK_MAGIC_IDENTITY, ip4, ep,
+					   METRIC_INGRESS, false, true, 0);
+
+to_host:
+	if (!revalidate_data(ctx, &data, &data_end, &ip4))
+		return DROP_INVALID;
+	return ipv4_host_delivery(ctx, ip4);
+
+drop_err:
+	return send_drop_notify_error_ext(ctx, src_id, ret, ext_err,
+					  CTX_ACT_DROP, METRIC_INGRESS);
+}
+#endif /* ENABLE_EGRESS_GATEWAY_COMMON */
 
 __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV4_FROM_OVERLAY)
 int tail_handle_ipv4(struct __ctx_buff *ctx)

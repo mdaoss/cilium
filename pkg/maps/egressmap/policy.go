@@ -35,10 +35,21 @@ type EgressPolicyKey4 struct {
 	DestCIDR types.IPv4 `align:"daddr"`
 }
 
+// HA active-gateway bitmask constants for EgressPolicyVal4.ActiveGW.
+const (
+	ActiveGW0    uint32 = 1 // gateway_ip_0 is active
+	ActiveGW1    uint32 = 2 // gateway_ip_1 is active
+	ActiveGWBoth uint32 = 3 // both gateways active
+)
+
 // EgressPolicyVal4 is the value of an egress policy map.
+// It carries two gateways in fixed slots for active/active HA egress.
+// The ActiveGW bitmask indicates which gateways are currently reachable.
 type EgressPolicyVal4 struct {
-	EgressIP  types.IPv4 `align:"egress_ip"`
-	GatewayIP types.IPv4 `align:"gateway_ip"`
+	EgressIP   types.IPv4 `align:"egress_ip"`
+	GatewayIP0 types.IPv4 `align:"gateway_ip_0"`
+	GatewayIP1 types.IPv4 `align:"gateway_ip_1"`
+	ActiveGW   uint32     `align:"active_gw"`
 }
 
 type PolicyConfig struct {
@@ -58,7 +69,7 @@ func (def PolicyConfig) Flags(flags *pflag.FlagSet) {
 // PolicyMap is used to communicate EGW policies to the datapath.
 type PolicyMap interface {
 	Lookup(sourceIP netip.Addr, destCIDR netip.Prefix) (*EgressPolicyVal4, error)
-	Update(sourceIP netip.Addr, destCIDR netip.Prefix, egressIP, gatewayIP netip.Addr) error
+	Update(sourceIP netip.Addr, destCIDR netip.Prefix, egressIP, gatewayIP0, gatewayIP1 netip.Addr, activeGW uint32) error
 	Delete(sourceIP netip.Addr, destCIDR netip.Prefix) error
 	IterateWithCallback(EgressPolicyIterateCallback) error
 }
@@ -150,13 +161,15 @@ func NewEgressPolicyKey4(sourceIP netip.Addr, destPrefix netip.Prefix) EgressPol
 	return key
 }
 
-// NewEgressPolicyVal4 returns a new EgressPolicyVal4 object representing for
-// the given egress IP and gateway IPs
-func NewEgressPolicyVal4(egressIP, gatewayIP netip.Addr) EgressPolicyVal4 {
+// NewEgressPolicyVal4 returns a new EgressPolicyVal4 for the given egress IP,
+// two gateway IPs in fixed slots, and the active-gateway bitmask.
+func NewEgressPolicyVal4(egressIP, gatewayIP0, gatewayIP1 netip.Addr, activeGW uint32) EgressPolicyVal4 {
 	val := EgressPolicyVal4{}
 
 	val.EgressIP.FromAddr(egressIP)
-	val.GatewayIP.FromAddr(gatewayIP)
+	val.GatewayIP0.FromAddr(gatewayIP0)
+	val.GatewayIP1.FromAddr(gatewayIP1)
+	val.ActiveGW = activeGW
 
 	return val
 }
@@ -191,26 +204,33 @@ func (k *EgressPolicyKey4) GetDestCIDR() netip.Prefix {
 // New returns an egress policy value
 func (v *EgressPolicyVal4) New() bpf.MapValue { return &EgressPolicyVal4{} }
 
-// Match returns true if the egressIP and gatewayIP parameters match the egress
-// policy value.
-func (v *EgressPolicyVal4) Match(egressIP, gatewayIP netip.Addr) bool {
+// Match returns true if the egressIP, both gatewayIPs, and activeGW flags
+// match the egress policy value.
+func (v *EgressPolicyVal4) Match(egressIP, gatewayIP0, gatewayIP1 netip.Addr, activeGW uint32) bool {
 	return v.GetEgressAddr() == egressIP &&
-		v.GetGatewayAddr() == gatewayIP
+		v.GetGatewayAddr0() == gatewayIP0 &&
+		v.GetGatewayAddr1() == gatewayIP1 &&
+		v.ActiveGW == activeGW
 }
 
-// GetEgressIP returns the egress policy value's egress IP.
+// GetEgressAddr returns the egress policy value's egress IP.
 func (v *EgressPolicyVal4) GetEgressAddr() netip.Addr {
 	return v.EgressIP.Addr()
 }
 
-// GetGatewayIP returns the egress policy value's gateway IP.
-func (v *EgressPolicyVal4) GetGatewayAddr() netip.Addr {
-	return v.GatewayIP.Addr()
+// GetGatewayAddr0 returns the egress policy value's first gateway IP.
+func (v *EgressPolicyVal4) GetGatewayAddr0() netip.Addr {
+	return v.GatewayIP0.Addr()
+}
+
+// GetGatewayAddr1 returns the egress policy value's second gateway IP.
+func (v *EgressPolicyVal4) GetGatewayAddr1() netip.Addr {
+	return v.GatewayIP1.Addr()
 }
 
 // String returns the string representation of an egress policy value.
 func (v *EgressPolicyVal4) String() string {
-	return fmt.Sprintf("%s %s", v.GetGatewayAddr(), v.GetEgressAddr())
+	return fmt.Sprintf("gw0=%s gw1=%s egress=%s active=%d", v.GetGatewayAddr0(), v.GetGatewayAddr1(), v.GetEgressAddr(), v.ActiveGW)
 }
 
 // Lookup returns the egress policy object associated with the provided (source
@@ -226,10 +246,10 @@ func (m *policyMap) Lookup(sourceIP netip.Addr, destCIDR netip.Prefix) (*EgressP
 }
 
 // Update updates the (sourceIP, destCIDR) egress policy entry with the provided
-// egress and gateway IPs.
-func (m *policyMap) Update(sourceIP netip.Addr, destCIDR netip.Prefix, egressIP, gatewayIP netip.Addr) error {
+// egress and gateway IPs and active-gateway bitmask.
+func (m *policyMap) Update(sourceIP netip.Addr, destCIDR netip.Prefix, egressIP, gatewayIP0, gatewayIP1 netip.Addr, activeGW uint32) error {
 	key := NewEgressPolicyKey4(sourceIP, destCIDR)
-	val := NewEgressPolicyVal4(egressIP, gatewayIP)
+	val := NewEgressPolicyVal4(egressIP, gatewayIP0, gatewayIP1, activeGW)
 
 	return m.m.Update(&key, &val)
 }

@@ -363,6 +363,13 @@ const (
 	// EnableIPv4EgressGateway enables the IPv4 egress gateway
 	EnableIPv4EgressGateway = "enable-ipv4-egress-gateway"
 
+	// EnableEgressGatewayHARedirect enables reply traffic interception on
+	// non-gateway nodes for HA egress gateway. When enabled, any node
+	// receiving reply traffic destined for an egress IP will redirect it
+	// via tunnel to the appropriate gateway for reverse SNAT, similar to
+	// externalTrafficPolicy: Cluster for LoadBalancer services.
+	EnableEgressGatewayHARedirect = "egress-gateway-ha-redirect"
+
 	// EnableEnvoyConfig enables processing of CiliumClusterwideEnvoyConfig and CiliumEnvoyConfig CRDs
 	EnableEnvoyConfig = "enable-envoy-config"
 
@@ -1723,8 +1730,9 @@ type DaemonConfig struct {
 	EnableIPMasqAgent           bool
 	IPMasqAgentConfigPath       string
 
-	EnableBPFClockProbe     bool
-	EnableIPv4EgressGateway bool
+	EnableBPFClockProbe            bool
+	EnableIPv4EgressGateway        bool
+	EnableEgressGatewayHARedirect  bool
 	EnableEnvoyConfig       bool
 	InstallIptRules         bool
 	MonitorAggregation      string
@@ -3104,6 +3112,7 @@ func (c *DaemonConfig) Populate(vp *viper.Viper) {
 	c.EnableBPFClockProbe = vp.GetBool(EnableBPFClockProbe)
 	c.EnableIPMasqAgent = vp.GetBool(EnableIPMasqAgent)
 	c.EnableIPv4EgressGateway = vp.GetBool(EnableIPv4EgressGateway)
+	c.EnableEgressGatewayHARedirect = vp.GetBool(EnableEgressGatewayHARedirect)
 	c.EnableEnvoyConfig = vp.GetBool(EnableEnvoyConfig)
 	c.IPMasqAgentConfigPath = vp.GetString(IPMasqAgentConfigPath)
 	c.InstallIptRules = vp.GetBool(InstallIptRules)

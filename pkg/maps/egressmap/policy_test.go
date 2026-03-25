@@ -34,23 +34,28 @@ func TestPolicyMap(t *testing.T) {
 	egressIP1 := netip.MustParseAddr("3.3.3.1")
 	egressIP2 := netip.MustParseAddr("3.3.3.2")
 
-	err := egressPolicyMap.Update(sourceIP1, destCIDR1, egressIP1, egressIP1)
+	gatewayA := netip.MustParseAddr("4.4.4.1")
+	gatewayB := netip.MustParseAddr("4.4.4.2")
+
+	err := egressPolicyMap.Update(sourceIP1, destCIDR1, egressIP1, gatewayA, gatewayB, ActiveGWBoth)
 	assert.Nil(t, err)
 
-	err = egressPolicyMap.Update(sourceIP2, destCIDR2, egressIP2, egressIP2)
+	err = egressPolicyMap.Update(sourceIP2, destCIDR2, egressIP2, gatewayA, netip.IPv4Unspecified(), ActiveGW0)
 	assert.Nil(t, err)
 
 	val, err := egressPolicyMap.Lookup(sourceIP1, destCIDR1)
 	assert.Nil(t, err)
 
 	assert.Equal(t, val.EgressIP.Addr(), egressIP1)
-	assert.Equal(t, val.GatewayIP.Addr(), egressIP1)
+	assert.Equal(t, val.GatewayIP0.Addr(), gatewayA)
+	assert.Equal(t, val.GatewayIP1.Addr(), gatewayB)
 
 	val, err = egressPolicyMap.Lookup(sourceIP2, destCIDR2)
 	assert.Nil(t, err)
 
 	assert.Equal(t, val.EgressIP.Addr(), egressIP2)
-	assert.Equal(t, val.GatewayIP.Addr(), egressIP2)
+	assert.Equal(t, val.GatewayIP0.Addr(), gatewayA)
+	assert.Equal(t, val.GatewayIP1.Addr(), netip.IPv4Unspecified())
 
 	err = egressPolicyMap.Delete(sourceIP2, destCIDR2)
 	assert.Nil(t, err)
@@ -59,7 +64,8 @@ func TestPolicyMap(t *testing.T) {
 	assert.Nil(t, err)
 
 	assert.Equal(t, val.EgressIP.Addr(), egressIP1)
-	assert.Equal(t, val.GatewayIP.Addr(), egressIP1)
+	assert.Equal(t, val.GatewayIP0.Addr(), gatewayA)
+	assert.Equal(t, val.GatewayIP1.Addr(), gatewayB)
 
 	_, err = egressPolicyMap.Lookup(sourceIP2, destCIDR2)
 	assert.True(t, errors.Is(err, ebpf.ErrKeyNotExist))

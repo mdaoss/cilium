@@ -82,6 +82,11 @@ external-workload-ca.crt
 external-workload-tls.crt
 external-workload-tls.key
 
+# HA egress test built binaries
+ha_egress_gw_test/client
+ha_egress_gw_test/client_static
+ha_egress_gw_test/server
+
 # GKE temporary files
 test/gke/cluster-name
 test/gke/cluster-uri

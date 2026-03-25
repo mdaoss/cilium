@@ -727,6 +727,36 @@ handle_ipv4_cont(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
 	}
 #endif /* ENABLE_HOST_FIREWALL */
 
+#ifdef ENABLE_EGRESS_GATEWAY_HA_REDIRECT
+	/* HA egress gateway reply redirect: if a packet arrives from the
+	 * network (not from cilium_host) with daddr matching a known egress
+	 * IP, and this node is NOT a gateway for that IP, redirect the packet
+	 * via tunnel to a gateway that can perform reverse SNAT.
+	 *
+	 * This enables externalTrafficPolicy:Cluster-like behavior for egress
+	 * gateway reply traffic — any node in the cluster can accept replies
+	 * and forward them to the correct gateway.
+	 */
+	if (!from_host) {
+		struct egress_gw_reverse_key rkey = {};
+		struct egress_gw_reverse_val *rval;
+
+		rkey.egress_ip = ip4->daddr;
+		rval = map_lookup_elem(&cilium_egress_gw_reverse4, &rkey);
+		if (rval && rval->gateway_ip_0 != 0) {
+			/* If this node is a gateway for this egress IP,
+			 * skip — the existing egress gateway logic handles it.
+			 */
+			if (rval->gateway_ip_0 != IPV4_DIRECT_ROUTING &&
+			    rval->gateway_ip_1 != IPV4_DIRECT_ROUTING) {
+				return __encap_and_redirect_with_nodeid(
+					ctx, 0, rval->gateway_ip_0,
+					secctx, 0, NOT_VTEP_DST, &trace);
+			}
+		}
+	}
+#endif /* ENABLE_EGRESS_GATEWAY_HA_REDIRECT */
+
 #ifndef ENABLE_HOST_ROUTING
 	/* Without bpf_redirect_neigh() helper, we cannot redirect a
 	 * packet to a local endpoint in the direct routing mode, as

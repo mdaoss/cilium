@@ -1753,6 +1753,35 @@ apply_snat:
 	if (IS_ERR(ret))
 		goto out;
 
+#if defined(ENABLE_EGRESS_GATEWAY) && defined(IS_BPF_HOST)
+	/* HA: after SNAT, populate the steering map so reply traffic can be
+	 * directed to the correct gateway for reverse SNAT. The owner recorded
+	 * in the steering entry must be the LOCAL node (which performed the
+	 * SNAT and holds the conntrack mapping), not the hash-selected owner.
+	 * Both gateways can SNAT traffic (using partitioned port ranges), so
+	 * the steering entry must point replies back to whichever node actually
+	 * holds the NAT state.
+	 */
+	if (target.egress_gateway && target.egress_gw_owner_ip != 0) {
+		if (!revalidate_data(ctx, &data, &data_end, &ip4))
+			return DROP_INVALID;
+
+		if (ip4->protocol == IPPROTO_TCP || ip4->protocol == IPPROTO_UDP) {
+			__be16 ports[2] = {0, 0};
+			int l4 = ETH_HLEN + ipv4_hdrlen(ip4);
+
+			if (ctx_load_bytes(ctx, l4, &ports, sizeof(ports)) >= 0) {
+				egress_gw_steer_update(
+					ip4->saddr, ip4->daddr,
+					ports[0], ports[1],
+					ip4->protocol,
+					IPV4_DIRECT_ROUTING,
+					target.egress_gw_owner_idx);
+			}
+		}
+	}
+#endif
+
 	/* If multiple netdevs process an outgoing packet, then this packets will
 	 * be handled multiple times by the "to-netdev" section. This can lead
 	 * to multiple SNATs. To prevent from that, set the SNAT done flag.
@@ -2595,6 +2624,30 @@ int tail_nodeport_nat_ingress_ipv4(struct __ctx_buff *ctx)
 	__s8 ext_err = 0;
 	int ret;
 
+	/* HA: before attempting reverse SNAT, check the steering map.
+	 * If a reply belongs to a flow owned by another gateway, redirect
+	 * it there immediately (skip the local rev SNAT attempt).
+	 */
+#if defined(ENABLE_EGRESS_GATEWAY) && !defined(IS_BPF_OVERLAY)
+	{
+		void *data, *data_end;
+		struct iphdr *ip4;
+
+		if (!revalidate_data(ctx, &data, &data_end, &ip4))
+			return DROP_INVALID;
+
+		ret = egress_gw_reply_steer(ctx, ip4, &ext_err);
+		if (ret != CTX_ACT_OK) {
+			if (IS_ERR(ret))
+				goto drop_err;
+			/* CTX_ACT_REDIRECT: packet was tunneled to owner */
+			edt_set_aggregate(ctx, 0);
+			cilium_capture_out(ctx);
+			return ret;
+		}
+	}
+#endif
+
 	ret = snat_v4_rev_nat(ctx, &target, &trace, &ext_err);
 	if (IS_ERR(ret)) {
 		if (ret == NAT_PUNT_TO_STACK ||
@@ -2604,6 +2657,25 @@ int tail_nodeport_nat_ingress_ipv4(struct __ctx_buff *ctx)
 		     * needed.
 		     */
 		    ret == DROP_NAT_NO_MAPPING) {
+#if defined(ENABLE_EGRESS_GATEWAY) && !defined(IS_BPF_OVERLAY)
+			/* HA fallback: if rev SNAT failed (no mapping) and
+			 * this is an egress gateway reply, try to redirect
+			 * to the other gateway. This handles the case where
+			 * the steering entry was evicted (LRU) but the flow
+			 * is still active.
+			 */
+			if (ret == DROP_NAT_NO_MAPPING) {
+				int egw_ret = egress_gw_reply_steer_fallback(ctx, &ext_err);
+
+				if (egw_ret != CTX_ACT_OK) {
+					if (IS_ERR(egw_ret))
+						goto drop_err;
+					edt_set_aggregate(ctx, 0);
+					cilium_capture_out(ctx);
+					return egw_ret;
+				}
+			}
+#endif
 			/* In case of no mapping, recircle back to
 			 * main path. SNAT is very expensive in terms
 			 * of instructions and

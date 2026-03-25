@@ -17,6 +17,7 @@ import (
 	"github.com/cilium/hive/cell"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
+	"go4.org/netipx"
 	"k8s.io/client-go/util/workqueue"
 
 	"github.com/cilium/cilium/pkg/datapath/linux/config/defines"
@@ -76,14 +77,46 @@ type Config struct {
 	// Default amount of time between triggers of egress gateway state
 	// reconciliations are invoked
 	EgressGatewayReconciliationTriggerInterval time.Duration
+
+	// EgressGatewayProbeInterval is the interval between health probes
+	// to remote gateway nodes. The prober TCP-connects to the Cilium
+	// health port (4240) on each gateway. After consecutive failures
+	// (failure-threshold × this interval), the gateway is removed from
+	// the policy map. Set to 0 to disable gateway health probing.
+	EgressGatewayProbeInterval time.Duration
+
+	// EgressGatewayProbeTimeout is the TCP connect timeout for each
+	// health probe to a remote gateway node.
+	EgressGatewayProbeTimeout time.Duration
+
+	// EgressGatewayProbeRecoveryThreshold is how many consecutive successful
+	// probes are required before a previously-failed gateway is restored to
+	// the policy map. A higher value gives the recovered Cilium agent more
+	// time to finish loading BPF programs and populating maps.
+	EgressGatewayProbeRecoveryThreshold int
+
+	// EgressGatewayProbeRecoveryHoldTime keeps a recovered gateway in
+	// single-gateway mode for an additional grace period before it can be
+	// selected again. This gives external reply-path convergence (ECMP/BGP)
+	// time to settle and reduces post-recovery asymmetric-reply pressure.
+	// Set to 0 to disable the hold.
+	EgressGatewayProbeRecoveryHoldTime time.Duration
 }
 
 var defaultConfig = Config{
 	EgressGatewayReconciliationTriggerInterval: 1 * time.Second,
+	EgressGatewayProbeInterval:                 1 * time.Second,
+	EgressGatewayProbeTimeout:                  defaultProbeTimeout,
+	EgressGatewayProbeRecoveryThreshold:        defaultRecoveryThreshold,
+	EgressGatewayProbeRecoveryHoldTime:         0,
 }
 
 func (def Config) Flags(flags *pflag.FlagSet) {
 	flags.Duration("egress-gateway-reconciliation-trigger-interval", def.EgressGatewayReconciliationTriggerInterval, "Time between triggers of egress gateway state reconciliations")
+	flags.Duration("egress-gateway-probe-interval", def.EgressGatewayProbeInterval, "Interval between health probes to remote egress gateway nodes (0 to disable)")
+	flags.Duration("egress-gateway-probe-timeout", def.EgressGatewayProbeTimeout, "TCP connect timeout for each health probe to a remote gateway node")
+	flags.Int("egress-gateway-probe-recovery-threshold", def.EgressGatewayProbeRecoveryThreshold, "Consecutive successful probes required before restoring a recovered gateway")
+	flags.Duration("egress-gateway-probe-recovery-hold-time", def.EgressGatewayProbeRecoveryHoldTime, "Additional hold time after a gateway recovers before it is re-selected for egress")
 }
 
 // The egressgateway manager stores the internal data tracking the node, policy,
@@ -125,6 +158,14 @@ type Manager struct {
 	// policyMap communicates the active policies to the datapath.
 	policyMap egressmap.PolicyMap
 
+	// reverseMap maps egress IPs to their gateway pairs for HA reply steering.
+	reverseMap egressmap.ReverseMap
+
+	// steerMap is the HA steering map used to direct reply traffic to the
+	// correct gateway. Flushed on gateway recovery to remove stale entries
+	// from single-gateway mode.
+	steerMap egressmap.SteerMap
+
 	// reconciliationTriggerInterval is the amount of time between triggers
 	// of reconciliations are invoked
 	reconciliationTriggerInterval time.Duration
@@ -144,6 +185,31 @@ type Manager struct {
 	reconciliationEventsCount atomic.Uint64
 
 	sysctl sysctl.Sysctl
+
+	// gwProber periodically checks gateway node health via TCP connects
+	// to the Cilium health port. When a gateway becomes unreachable, it
+	// is excluded from policy map entries until it recovers.
+	gwProber *gatewayProber
+
+	// gwHealthCh receives health status changes from the gateway prober.
+	gwHealthCh chan gatewayHealthEvent
+
+	// unhealthyGateways tracks gateway nodes that failed health probes.
+	// Nodes in this set are skipped during gateway selection in
+	// regenerateGatewayConfig(). Protected by Manager.Mutex.
+	unhealthyGateways map[string]struct{}
+
+	// recoveredGatewayHoldUntil keeps recovered gateways in a temporary hold
+	// state after probe-based recovery. While a node is in this map and
+	// holdUntil is in the future, gateway selection treats it as unavailable.
+	recoveredGatewayHoldUntil map[string]time.Time
+
+	// recoveredGatewayTimers trigger reconciliation when a recovery-hold
+	// period elapses.
+	recoveredGatewayTimers map[string]*time.Timer
+
+	// probeRecoveryHoldTime is the configured post-recovery hold duration.
+	probeRecoveryHoldTime time.Duration
 }
 
 type Params struct {
@@ -153,6 +219,8 @@ type Params struct {
 	DaemonConfig      *option.DaemonConfig
 	IdentityAllocator identityCache.IdentityAllocator
 	PolicyMap         egressmap.PolicyMap
+	ReverseMap        egressmap.ReverseMap
+	SteerMap          egressmap.SteerMap
 	Policies          resource.Resource[*Policy]
 	Nodes             resource.Resource[*cilium_api_v2.CiliumNode]
 	Endpoints         resource.Resource[*k8sTypes.CiliumEndpoint]
@@ -199,12 +267,17 @@ func NewEgressGatewayManager(p Params) (out struct {
 		"ENABLE_EGRESS_GATEWAY": "1",
 	}
 
+	if dcfg.EnableEgressGatewayHARedirect {
+		out.NodeDefines["ENABLE_EGRESS_GATEWAY_HA_REDIRECT"] = "1"
+	}
+
 	out.EnablerOut = tunnel.NewEnabler(true)
 
 	return out, nil
 }
 
 func newEgressGatewayManager(p Params) (*Manager, error) {
+	healthCh := make(chan gatewayHealthEvent, 16)
 	manager := &Manager{
 		policyConfigs:                 make(map[policyID]*PolicyConfig),
 		policyConfigsBySourceIP:       make(map[string][]*PolicyConfig),
@@ -212,10 +285,21 @@ func newEgressGatewayManager(p Params) (*Manager, error) {
 		identityAllocator:             p.IdentityAllocator,
 		reconciliationTriggerInterval: p.Config.EgressGatewayReconciliationTriggerInterval,
 		policyMap:                     p.PolicyMap,
+		reverseMap:                    p.ReverseMap,
+		steerMap:                      p.SteerMap,
 		policies:                      p.Policies,
 		ciliumNodes:                   p.Nodes,
 		endpoints:                     p.Endpoints,
 		sysctl:                        p.Sysctl,
+		gwHealthCh:                    healthCh,
+		unhealthyGateways:             make(map[string]struct{}),
+		recoveredGatewayHoldUntil:     make(map[string]time.Time),
+		recoveredGatewayTimers:        make(map[string]*time.Timer),
+		probeRecoveryHoldTime:         p.Config.EgressGatewayProbeRecoveryHoldTime,
+	}
+
+	if p.Config.EgressGatewayProbeInterval > 0 {
+		manager.gwProber = newGatewayProber(healthCh, p.Config.EgressGatewayProbeInterval, p.Config.EgressGatewayProbeTimeout, p.Config.EgressGatewayProbeRecoveryThreshold)
 	}
 
 	t, err := trigger.NewTrigger(trigger.Parameters{
@@ -247,6 +331,13 @@ func newEgressGatewayManager(p Params) (*Manager, error) {
 				defer wg.Done()
 				manager.processEvents(ctx)
 			}()
+			if manager.gwProber != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					manager.gwProber.run(ctx)
+				}()
+			}
 
 			return nil
 		},
@@ -355,6 +446,9 @@ func (manager *Manager) processEvents(ctx context.Context) {
 			} else {
 				manager.handleEndpointEvent(event)
 			}
+
+		case event := <-manager.gwHealthCh:
+			manager.handleGatewayHealthEvent(event)
 		}
 	}
 }
@@ -531,6 +625,148 @@ func (manager *Manager) handleNodeEvent(event resource.Event[*cilium_api_v2.Cili
 	manager.reconciliationTrigger.TriggerWithReason("node updated")
 }
 
+// handleGatewayHealthEvent processes a health status change from the gateway
+// prober. When a gateway becomes unhealthy, it is added to the unhealthy set
+// so regenerateGatewayConfig() skips it. When it recovers, it is removed
+// and the steering map is flushed to clear stale entries from single-gateway
+// mode that would cause reply misrouting.
+func (manager *Manager) handleGatewayHealthEvent(event gatewayHealthEvent) {
+	manager.Lock()
+	defer manager.Unlock()
+
+	if event.healthy {
+		_, wasUnhealthy := manager.unhealthyGateways[event.nodeName]
+		delete(manager.unhealthyGateways, event.nodeName)
+
+		if wasUnhealthy && manager.probeRecoveryHoldTime > 0 {
+			holdUntil := time.Now().Add(manager.probeRecoveryHoldTime)
+			manager.recoveredGatewayHoldUntil[event.nodeName] = holdUntil
+
+			if existing := manager.recoveredGatewayTimers[event.nodeName]; existing != nil {
+				existing.Stop()
+			}
+
+			nodeName := event.nodeName
+			manager.recoveredGatewayTimers[event.nodeName] = time.AfterFunc(manager.probeRecoveryHoldTime, func() {
+				manager.reconciliationTrigger.TriggerWithReason("gateway recovery hold elapsed: " + nodeName)
+			})
+
+			log.WithField(logfields.NodeName, event.nodeName).
+				WithField("holdDuration", manager.probeRecoveryHoldTime).
+				WithField("holdUntil", holdUntil).
+				Info("Gateway recovered, entering post-recovery hold before policy restore")
+		}
+
+		// When a gateway recovers, flush the steering map.
+		// During single-gateway mode the surviving gateway used the full
+		// SNAT port range and created steering entries claiming ownership
+		// of all flows. After recovery, the port range is partitioned and
+		// these stale entries would misdirect replies. Flushing is safe —
+		// the steering map is an LRU cache and new entries are created on
+		// every SNAT'd packet.
+		if wasUnhealthy && manager.steerMap != nil {
+			flushed := manager.steerMap.Flush()
+			log.WithField("nodeName", event.nodeName).
+				WithField("flushedEntries", flushed).
+				Info("Gateway recovered, flushed steering map to clear stale entries")
+		}
+	} else {
+		manager.unhealthyGateways[event.nodeName] = struct{}{}
+		delete(manager.recoveredGatewayHoldUntil, event.nodeName)
+		if timer := manager.recoveredGatewayTimers[event.nodeName]; timer != nil {
+			timer.Stop()
+			delete(manager.recoveredGatewayTimers, event.nodeName)
+		}
+	}
+
+	manager.reconciliationTrigger.TriggerWithReason("gateway health changed: " + event.nodeName)
+}
+
+// updateProberTargets collects all remote gateway node IPs from the current
+// policy configs and updates the prober's target list. Called after
+// reconciliation so the prober only probes nodes that are actually gateways.
+func (manager *Manager) updateProberTargets() {
+	if manager.gwProber == nil {
+		return
+	}
+
+	seen := make(map[string]struct{})
+	var targets []gatewayTarget
+
+	for _, node := range manager.nodes {
+		if node.IsLocal() {
+			continue
+		}
+
+		// Check if this node is selected as gateway by any policy.
+		isGateway := false
+		for _, pc := range manager.policyConfigs {
+			if pc.policyGwConfig.selectsNodeAsGateway(node) {
+				isGateway = true
+				break
+			}
+		}
+		if !isGateway {
+			continue
+		}
+
+		if _, ok := seen[node.Name]; ok {
+			continue
+		}
+		seen[node.Name] = struct{}{}
+
+		ip := node.GetK8sNodeIP()
+		if ip == nil {
+			continue
+		}
+		addr, ok := netipx.FromStdIP(ip)
+		if !ok {
+			continue
+		}
+
+		targets = append(targets, gatewayTarget{
+			name: node.Name,
+			ip:   addr,
+		})
+	}
+
+	manager.gwProber.setTargets(targets)
+
+	// Prune unhealthyGateways entries for nodes that are no longer active
+	// probe targets. Use the actual targets slice (not the seen set) because
+	// seen includes nodes that matched the gateway selector but failed IP
+	// validation — those nodes are not probed, so their stale unhealthy
+	// entries must still be pruned.
+	activeTargets := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		activeTargets[t.name] = struct{}{}
+	}
+	needsReconcile := false
+	for name := range manager.unhealthyGateways {
+		if _, active := activeTargets[name]; !active {
+			delete(manager.unhealthyGateways, name)
+			delete(manager.recoveredGatewayHoldUntil, name)
+			if timer := manager.recoveredGatewayTimers[name]; timer != nil {
+				timer.Stop()
+				delete(manager.recoveredGatewayTimers, name)
+			}
+			needsReconcile = true
+			log.WithField(logfields.NodeName, name).
+				Info("Pruned stale unhealthy gateway entry (node no longer an active target)")
+		}
+	}
+	if needsReconcile {
+		if manager.steerMap != nil {
+			flushed := manager.steerMap.Flush()
+			log.WithField("flushedEntries", flushed).
+				Info("Flushed steering map after pruning stale unhealthy gateway entries")
+		}
+		// Trigger another reconciliation so regenerateGatewayConfig()
+		// picks up the now-cleared unhealthy entries.
+		manager.reconciliationTrigger.TriggerWithReason("pruned stale unhealthy gateways")
+	}
+}
+
 func (manager *Manager) updatePoliciesMatchedEndpointIDs() {
 	for _, policy := range manager.policyConfigs {
 		policy.updateMatchedEndpointIDs(manager.epDataStore)
@@ -639,12 +875,26 @@ func (manager *Manager) addMissingEgressRules() {
 		policyKey := egressmap.NewEgressPolicyKey4(endpointIP, dstCIDR)
 		policyVal, policyPresent := egressPolicies[policyKey]
 
-		gatewayIP := gwc.gatewayIP
+		gw0 := gwc.gatewayIP
+		gw1 := gwc.gatewayIP1
+		activeGW := gwc.activeGW
 		if excludedCIDR {
-			gatewayIP = ExcludedCIDRIPv4
+			gw0 = ExcludedCIDRIPv4
+			gw1 = netip.IPv4Unspecified()
+			activeGW = 0
+		} else if activeGW == 0 {
+			// All configured gateways are currently inactive
+			// (unhealthy or in recovery hold). Write NO_GATEWAY
+			// to trigger the BPF-level drop. We avoid writing
+			// active_gw=0 with valid gateway IPs because that
+			// is indistinguishable from legacy entries (where
+			// the old pad field was zero) and would fall through
+			// to the legacy code path instead of dropping.
+			gw0 = GatewayNotFoundIPv4
+			gw1 = netip.IPv4Unspecified()
 		}
 
-		if policyPresent && policyVal.Match(gwc.egressIP, gatewayIP) {
+		if policyPresent && policyVal.Match(gwc.egressIP, gw0, gw1, activeGW) {
 			return
 		}
 
@@ -652,10 +902,10 @@ func (manager *Manager) addMissingEgressRules() {
 			logfields.SourceIP:        endpointIP,
 			logfields.DestinationCIDR: dstCIDR.String(),
 			logfields.EgressIP:        gwc.egressIP,
-			logfields.GatewayIP:       gatewayIP,
+			logfields.GatewayIP:       fmt.Sprintf("%s,%s", gw0, gw1),
 		})
 
-		if err := manager.policyMap.Update(endpointIP, dstCIDR, gwc.egressIP, gatewayIP); err != nil {
+		if err := manager.policyMap.Update(endpointIP, dstCIDR, gwc.egressIP, gw0, gw1, activeGW); err != nil {
 			logger.WithError(err).Error("Error applying egress gateway policy")
 		} else {
 			logger.Debug("Egress gateway policy applied")
@@ -678,12 +928,19 @@ func (manager *Manager) removeUnusedEgressRules() {
 
 	for policyKey, policyVal := range egressPolicies {
 		matchPolicy := func(endpointIP netip.Addr, dstCIDR netip.Prefix, excludedCIDR bool, gwc *gatewayConfig) bool {
-			gatewayIP := gwc.gatewayIP
+			gw0 := gwc.gatewayIP
+			gw1 := gwc.gatewayIP1
+			activeGW := gwc.activeGW
 			if excludedCIDR {
-				gatewayIP = ExcludedCIDRIPv4
+				gw0 = ExcludedCIDRIPv4
+				gw1 = netip.IPv4Unspecified()
+				activeGW = 0
+			} else if activeGW == 0 {
+				gw0 = GatewayNotFoundIPv4
+				gw1 = netip.IPv4Unspecified()
 			}
 
-			return policyKey.Match(endpointIP, dstCIDR) && policyVal.Match(gwc.egressIP, gatewayIP)
+			return policyKey.Match(endpointIP, dstCIDR) && policyVal.Match(gwc.egressIP, gw0, gw1, activeGW)
 		}
 
 		if manager.policyMatches(policyKey.GetSourceIP(), matchPolicy) {
@@ -694,7 +951,7 @@ func (manager *Manager) removeUnusedEgressRules() {
 			logfields.SourceIP:        policyKey.GetSourceIP(),
 			logfields.DestinationCIDR: policyKey.GetDestCIDR().String(),
 			logfields.EgressIP:        policyVal.GetEgressAddr(),
-			logfields.GatewayIP:       policyVal.GetGatewayAddr(),
+			logfields.GatewayIP:       fmt.Sprintf("%s,%s", policyVal.GetGatewayAddr0(), policyVal.GetGatewayAddr1()),
 		})
 
 		if err := manager.policyMap.Delete(policyKey.GetSourceIP(), policyKey.GetDestCIDR()); err != nil {
@@ -703,6 +960,59 @@ func (manager *Manager) removeUnusedEgressRules() {
 			logger.Debug("Egress gateway policy removed")
 		}
 	}
+}
+
+// reconcileReverseMap populates the reverse lookup map (egress_ip → gw0, gw1)
+// used by the BPF datapath to redirect reply traffic on non-owner gateways.
+func (manager *Manager) reconcileReverseMap() {
+	if manager.reverseMap == nil {
+		return
+	}
+
+	// Collect desired state: egress IP → (gw0, gw1).
+	// Only active gateways go in the reverse map. When one gateway
+	// is down, the surviving one is compacted to slot 0 so the BPF
+	// port-based steering code safely skips (gw1==0).
+	desired := make(map[netip.Addr][2]netip.Addr)
+	for _, pc := range manager.policyConfigs {
+		gwc := &pc.gatewayConfig
+		if !gwc.egressIP.IsValid() || gwc.egressIP == EgressIPNotFoundIPv4 {
+			continue
+		}
+		gw0 := GatewayNotFoundIPv4
+		gw1 := GatewayNotFoundIPv4
+		if gwc.activeGW&egressmap.ActiveGW0 != 0 {
+			gw0 = gwc.gatewayIP
+		}
+		if gwc.activeGW&egressmap.ActiveGW1 != 0 {
+			gw1 = gwc.gatewayIP1
+		}
+		// Compact: if only gw1 is active, move it to slot 0
+		if gw0 == GatewayNotFoundIPv4 && gw1 != GatewayNotFoundIPv4 {
+			gw0 = gw1
+			gw1 = GatewayNotFoundIPv4
+		}
+		desired[gwc.egressIP] = [2]netip.Addr{gw0, gw1}
+	}
+
+	// Update or add entries
+	for egressIP, gws := range desired {
+		if err := manager.reverseMap.Update(egressIP, gws[0], gws[1]); err != nil {
+			log.WithError(err).WithField(logfields.EgressIP, egressIP).
+				Error("Error updating egress gateway reverse map")
+		}
+	}
+
+	// Remove stale entries
+	manager.reverseMap.IterateWithCallback(func(key *egressmap.EgressReverseKey4, val *egressmap.EgressReverseVal4) {
+		addr := key.EgressIP.Addr()
+		if _, ok := desired[addr]; !ok {
+			if err := manager.reverseMap.Delete(addr); err != nil {
+				log.WithError(err).WithField(logfields.EgressIP, addr).
+					Error("Error removing stale egress gateway reverse map entry")
+			}
+		}
+	})
 }
 
 // reconcileLocked is responsible for reconciling the state of the manager (i.e. the
@@ -746,6 +1056,11 @@ func (manager *Manager) reconcileLocked() {
 	// only then removing obsolete ones we make sure there will be no connectivity disruption
 	manager.addMissingEgressRules()
 	manager.removeUnusedEgressRules()
+	manager.reconcileReverseMap()
+
+	// Update the prober with current gateway targets so it probes only
+	// nodes that are actually selected as gateways.
+	manager.updateProberTargets()
 
 	// clear the events bitmap
 	manager.eventsBitmap = 0

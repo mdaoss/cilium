@@ -137,7 +137,8 @@ enum {
 #define CILIUM_CALL_IPV4_NO_SERVICE		47
 #define CILIUM_CALL_IPV6_NO_SERVICE		48
 #define CILIUM_CALL_MULTICAST_EP_DELIVERY       49
-#define CILIUM_CALL_SIZE			50
+#define CILIUM_CALL_IPV4_EGW_OVERLAY_REVSNAT	50
+#define CILIUM_CALL_SIZE			51
 
 typedef __u64 mac_t;
 
@@ -456,9 +457,47 @@ struct egress_gw_policy_key {
 	__u32 daddr;
 };
 
+/* HA active-gateway bitmask for egress_gw_policy_entry.active_gw */
+#define EGRESS_GW_ACTIVE_0    1  /* gateway_ip_0 is active */
+#define EGRESS_GW_ACTIVE_1    2  /* gateway_ip_1 is active */
+#define EGRESS_GW_ACTIVE_BOTH 3  /* both gateways active */
+
 struct egress_gw_policy_entry {
-	__u32 egress_ip;
-	__u32 gateway_ip;
+	__u32 egress_ip;	/* SNAT IP from policy spec */
+	__u32 gateway_ip_0;	/* Gateway 0 node IP (fixed slot) */
+	__u32 gateway_ip_1;	/* Gateway 1 node IP (fixed slot) */
+	__u32 active_gw;	/* Bitmask: which gateways are active */
+};
+
+/* Reverse lookup: egress IP → gateway pair.
+ * Used by non-owner gateways to redirect reply traffic when no local
+ * SNAT mapping or steering entry exists.
+ */
+struct egress_gw_reverse_key {
+	__be32 egress_ip;
+};
+
+struct egress_gw_reverse_val {
+	__be32 gateway_ip_0;
+	__be32 gateway_ip_1;
+};
+
+/* Steering map key for egress gateway active/active reply-path steering.
+ * Keyed by the reply-path 5-tuple (before reverse SNAT).
+ */
+struct egress_gw_steer_key {
+	__u32 saddr;	/* Reply src: server IP */
+	__u32 daddr;	/* Reply dst: egress IP */
+	__u16 sport;	/* Reply sport: server port */
+	__u16 dport;	/* Reply dport: SNAT port */
+	__u8  nexthdr;	/* L4 protocol */
+	__u8  pad[3];
+};
+
+struct egress_gw_steer_val {
+	__u32 owner_ip;		/* Node internal IP of hashed owner gateway */
+	__u8  owner_idx;	/* 0 or 1 */
+	__u8  pad[3];
 };
 
 struct srv6_vrf_key4 {

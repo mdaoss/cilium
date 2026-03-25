@@ -83,17 +83,21 @@ var (
 )
 
 type egressRule struct {
-	sourceIP  string
-	destCIDR  string
-	egressIP  string
-	gatewayIP string
+	sourceIP   string
+	destCIDR   string
+	egressIP   string
+	gatewayIP  string
+	gatewayIP1 string
+	activeGW   uint32
 }
 
 type parsedEgressRule struct {
-	sourceIP  netip.Addr
-	destCIDR  netip.Prefix
-	egressIP  netip.Addr
-	gatewayIP netip.Addr
+	sourceIP   netip.Addr
+	destCIDR   netip.Prefix
+	egressIP   netip.Addr
+	gatewayIP  netip.Addr
+	gatewayIP1 netip.Addr
+	activeGW   uint32
 }
 
 type rpFilterSetting struct {
@@ -129,7 +133,7 @@ func setupEgressGatewayTestSuite(t *testing.T) *EgressGatewayTestSuite {
 
 	k.manager, err = newEgressGatewayManager(Params{
 		Lifecycle:         lc,
-		Config:            Config{1 * time.Millisecond},
+		Config:            Config{EgressGatewayReconciliationTriggerInterval: 1 * time.Millisecond},
 		DaemonConfig:      &option.DaemonConfig{ConfigPatchMutex: new(lock.RWMutex)},
 		IdentityAllocator: identityAllocator,
 		PolicyMap:         policyMap,
@@ -269,7 +273,7 @@ func TestEgressGatewayManager(t *testing.T) {
 	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep1IP, destCIDR, egressIP1, node1IP},
+		{ep1IP, destCIDR, egressIP1, node1IP, "", egressmap.ActiveGW0},
 	})
 
 	// Update the endpoint labels in order for it to not be a match
@@ -285,7 +289,7 @@ func TestEgressGatewayManager(t *testing.T) {
 	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep1IP, destCIDR, egressIP1, node1IP},
+		{ep1IP, destCIDR, egressIP1, node1IP, "", egressmap.ActiveGW0},
 	})
 
 	// Changing the DestCIDR to 0.0.0.0 results in a conflict with
@@ -296,7 +300,7 @@ func TestEgressGatewayManager(t *testing.T) {
 	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep1IP, allZeroDestCIDR, egressIP1, node1IP},
+		{ep1IP, allZeroDestCIDR, egressIP1, node1IP, "", egressmap.ActiveGW0},
 	})
 
 	// Restore old DestCIDR
@@ -314,7 +318,7 @@ func TestEgressGatewayManager(t *testing.T) {
 	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep1IP, destCIDR, egressIP1, node1IP},
+		{ep1IP, destCIDR, egressIP1, node1IP, "", egressmap.ActiveGW0},
 	})
 
 	// Add a new endpoint and ID which matches policy-2
@@ -323,8 +327,8 @@ func TestEgressGatewayManager(t *testing.T) {
 	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep1IP, destCIDR, egressIP1, node1IP},
-		{ep2IP, destCIDR, zeroIP4, node2IP},
+		{ep1IP, destCIDR, egressIP1, node1IP, "", egressmap.ActiveGW0},
+		{ep2IP, destCIDR, zeroIP4, node2IP, "", egressmap.ActiveGW0},
 	})
 
 	// Test excluded CIDRs by adding one to policy-1
@@ -339,9 +343,9 @@ func TestEgressGatewayManager(t *testing.T) {
 	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep1IP, destCIDR, egressIP1, node1IP},
-		{ep1IP, excludedCIDR1, egressIP1, gatewayExcludedCIDRValue},
-		{ep2IP, destCIDR, zeroIP4, node2IP},
+		{ep1IP, destCIDR, egressIP1, node1IP, "", egressmap.ActiveGW0},
+		{ep1IP, excludedCIDR1, egressIP1, gatewayExcludedCIDRValue, "", 0},
+		{ep2IP, destCIDR, zeroIP4, node2IP, "", egressmap.ActiveGW0},
 	})
 
 	// Add a second excluded CIDR to policy-1
@@ -356,10 +360,10 @@ func TestEgressGatewayManager(t *testing.T) {
 	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep1IP, destCIDR, egressIP1, node1IP},
-		{ep1IP, excludedCIDR1, egressIP1, gatewayExcludedCIDRValue},
-		{ep1IP, excludedCIDR2, egressIP1, gatewayExcludedCIDRValue},
-		{ep2IP, destCIDR, zeroIP4, node2IP},
+		{ep1IP, destCIDR, egressIP1, node1IP, "", egressmap.ActiveGW0},
+		{ep1IP, excludedCIDR1, egressIP1, gatewayExcludedCIDRValue, "", 0},
+		{ep1IP, excludedCIDR2, egressIP1, gatewayExcludedCIDRValue, "", 0},
+		{ep2IP, destCIDR, zeroIP4, node2IP, "", egressmap.ActiveGW0},
 	})
 
 	// Remove the first excluded CIDR from policy-1
@@ -374,9 +378,9 @@ func TestEgressGatewayManager(t *testing.T) {
 	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep1IP, destCIDR, egressIP1, node1IP},
-		{ep1IP, excludedCIDR2, egressIP1, gatewayExcludedCIDRValue},
-		{ep2IP, destCIDR, zeroIP4, node2IP},
+		{ep1IP, destCIDR, egressIP1, node1IP, "", egressmap.ActiveGW0},
+		{ep1IP, excludedCIDR2, egressIP1, gatewayExcludedCIDRValue, "", 0},
+		{ep2IP, destCIDR, zeroIP4, node2IP, "", egressmap.ActiveGW0},
 	})
 
 	// Remove the second excluded CIDR
@@ -390,8 +394,8 @@ func TestEgressGatewayManager(t *testing.T) {
 	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep1IP, destCIDR, egressIP1, node1IP},
-		{ep2IP, destCIDR, zeroIP4, node2IP},
+		{ep1IP, destCIDR, egressIP1, node1IP, "", egressmap.ActiveGW0},
+		{ep2IP, destCIDR, zeroIP4, node2IP, "", egressmap.ActiveGW0},
 	})
 
 	// Test matching no gateway
@@ -405,8 +409,8 @@ func TestEgressGatewayManager(t *testing.T) {
 	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep1IP, destCIDR, zeroIP4, gatewayNotFoundValue},
-		{ep2IP, destCIDR, zeroIP4, node2IP},
+		{ep1IP, destCIDR, zeroIP4, gatewayNotFoundValue, "", 0},
+		{ep2IP, destCIDR, zeroIP4, node2IP, "", egressmap.ActiveGW0},
 	})
 
 	// Test a policy without valid egressIP
@@ -420,9 +424,9 @@ func TestEgressGatewayManager(t *testing.T) {
 	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep1IP, destCIDR, zeroIP4, gatewayNotFoundValue},
-		{ep1IP, destCIDR3, egressIPNotFoundValue, node1IP},
-		{ep2IP, destCIDR, zeroIP4, node2IP},
+		{ep1IP, destCIDR, zeroIP4, gatewayNotFoundValue, "", 0},
+		{ep1IP, destCIDR3, egressIPNotFoundValue, node1IP, "", egressmap.ActiveGW0},
+		{ep2IP, destCIDR, zeroIP4, node2IP, "", egressmap.ActiveGW0},
 	})
 
 	// Update the endpoint labels in order for it to not be a match
@@ -431,7 +435,7 @@ func TestEgressGatewayManager(t *testing.T) {
 	waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep2IP, destCIDR, zeroIP4, node2IP},
+		{ep2IP, destCIDR, zeroIP4, node2IP, "", egressmap.ActiveGW0},
 	})
 }
 
@@ -476,7 +480,7 @@ func TestEndpointDataStore(t *testing.T) {
 	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep1IP, destCIDR, egressIP1, node1IP},
+		{ep1IP, destCIDR, egressIP1, node1IP, "", egressmap.ActiveGW0},
 	})
 
 	// Simulate statefulset pod migrations to a different node.
@@ -492,7 +496,7 @@ func TestEndpointDataStore(t *testing.T) {
 	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep2IP, destCIDR, egressIP1, node1IP},
+		{ep2IP, destCIDR, egressIP1, node1IP, "", egressmap.ActiveGW0},
 	})
 
 	// Produce a new endpoint ep3 similar to ep2 (and ep1) - with the same name & labels, but with a different IP address.
@@ -505,7 +509,7 @@ func TestEndpointDataStore(t *testing.T) {
 	waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
 	assertEgressRules(t, policyMap, []egressRule{
-		{ep3IP, destCIDR, egressIP1, node1IP},
+		{ep3IP, destCIDR, egressIP1, node1IP, "", egressmap.ActiveGW0},
 	})
 }
 
@@ -628,17 +632,24 @@ func updateEndpointAndIdentity(endpoint *k8sTypes.CiliumEndpoint, oldID *identit
 	return newID
 }
 
-func parseEgressRule(sourceIP, destCIDR, egressIP, gatewayIP string) parsedEgressRule {
-	sip := netip.MustParseAddr(sourceIP)
-	dc := netip.MustParsePrefix(destCIDR)
-	eip := netip.MustParseAddr(egressIP)
-	gip := netip.MustParseAddr(gatewayIP)
+func parseEgressRule(r egressRule) parsedEgressRule {
+	sip := netip.MustParseAddr(r.sourceIP)
+	dc := netip.MustParsePrefix(r.destCIDR)
+	eip := netip.MustParseAddr(r.egressIP)
+	gip := netip.MustParseAddr(r.gatewayIP)
+
+	gip1 := netip.IPv4Unspecified()
+	if r.gatewayIP1 != "" {
+		gip1 = netip.MustParseAddr(r.gatewayIP1)
+	}
 
 	return parsedEgressRule{
-		sourceIP:  sip,
-		destCIDR:  dc,
-		egressIP:  eip,
-		gatewayIP: gip,
+		sourceIP:   sip,
+		destCIDR:   dc,
+		egressIP:   eip,
+		gatewayIP:  gip,
+		gatewayIP1: gip1,
+		activeGW:   r.activeGW,
 	}
 }
 
@@ -652,7 +663,7 @@ func assertEgressRules(t *testing.T, policyMap egressmap.PolicyMap, rules []egre
 func tryAssertEgressRules(policyMap egressmap.PolicyMap, rules []egressRule) error {
 	parsedRules := []parsedEgressRule{}
 	for _, r := range rules {
-		parsedRules = append(parsedRules, parseEgressRule(r.sourceIP, r.destCIDR, r.egressIP, r.gatewayIP))
+		parsedRules = append(parsedRules, parseEgressRule(r))
 	}
 
 	for _, r := range parsedRules {
@@ -665,8 +676,16 @@ func tryAssertEgressRules(policyMap egressmap.PolicyMap, rules []egressRule) err
 			return fmt.Errorf("mismatched egress IP")
 		}
 
-		if policyVal.GetGatewayAddr() != r.gatewayIP {
-			return fmt.Errorf("mismatched gateway IP")
+		if policyVal.GetGatewayAddr0() != r.gatewayIP {
+			return fmt.Errorf("mismatched gateway IP 0")
+		}
+
+		if policyVal.GetGatewayAddr1() != r.gatewayIP1 {
+			return fmt.Errorf("mismatched gateway IP 1")
+		}
+
+		if policyVal.ActiveGW != r.activeGW {
+			return fmt.Errorf("mismatched activeGW: got %d, want %d", policyVal.ActiveGW, r.activeGW)
 		}
 	}
 
@@ -674,7 +693,7 @@ func tryAssertEgressRules(policyMap egressmap.PolicyMap, rules []egressRule) err
 	policyMap.IterateWithCallback(
 		func(key *egressmap.EgressPolicyKey4, val *egressmap.EgressPolicyVal4) {
 			for _, r := range parsedRules {
-				if key.Match(r.sourceIP, r.destCIDR) && val.Match(r.egressIP, r.gatewayIP) {
+				if key.Match(r.sourceIP, r.destCIDR) && val.Match(r.egressIP, r.gatewayIP, r.gatewayIP1, r.activeGW) {
 					return
 				}
 			}
