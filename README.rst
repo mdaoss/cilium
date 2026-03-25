@@ -7,6 +7,35 @@
 
 |cii| |go-report| |clomonitor| |artifacthub| |slack| |go-doc| |rtd| |apache| |bsd| |gpl| |fossa| |gateway-api| |codespaces|
 
+.. note::
+Fork: Active/Active HA Egress Gateway (IPv4)
+===============
+
+   This is a fork of Cilium v1.16.10 that adds **active/active high-availability
+   egress gateway** support. Vanilla Cilium routes each egress policy through a
+   single gateway node; this fork allows **two gateways to serve traffic
+   simultaneously** with automatic failover.
+
+   Key differences from upstream:
+
+   - **Dual-gateway policy map** — each policy entry carries two gateway IPs in
+     fixed slots plus an ``active_gw`` bitmask indicating which are reachable.
+   - **Per-flow reply steering** — a new BPF steering map (LRU, 64K entries)
+     pins each flow's reply path to its owner gateway, with cross-gateway
+     tunnel redirect on miss.
+   - **SNAT port partitioning** — each gateway uses a dedicated half of the
+     ephemeral port range, eliminating SNAT collisions between gateways.
+   - **Gateway health probing & recovery hold** — the control plane probes
+     gateway liveness and gates re-admission to avoid traffic disruption during
+     recovery.
+   - **Optional HA redirect** — non-gateway nodes can intercept reply traffic
+     and tunnel it to a gateway (``egress-gateway-ha-redirect: "true"``).
+
+   Validated at 60K concurrent TCP connections and 150K HTTP/2 requests at
+   500 rps with gateway failure/recovery, zero failures. See
+   ``HA_EGRESS_GW_DESIGN.md`` for the full architecture.
+===============
+
 Cilium is a networking, observability, and security solution with an eBPF-based
 dataplane. It provides a simple flat Layer 3 network with the ability to span
 multiple clusters in either a native routing or overlay mode. It is L7-protocol
