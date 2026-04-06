@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/spf13/cobra"
 	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
@@ -1407,4 +1408,17 @@ func TestApiRateLimitValidation(t *testing.T) {
 		"endpoint-list": "auto-adjust:true,estimated-processing-duration:300ms,rate-limit:16/s,rate-burst:32,min-parallel-requests:8,max-parallel-requests:16,log:false", 
 		"endpoint-patch": "auto-adjust:true,estimated-processing-duration:200ms,rate-limit:16/s,rate-burst:32,min-parallel-requests:16,max-parallel-requests:128,log:false"
 		}`), "must accept JSON object")
+}
+
+func TestValidateConfigMapRejectsRemovedOption(t *testing.T) {
+	cmd := &cobra.Command{Use: "cilium-agent"}
+	cmd.Flags().Bool(EnableIPv4EgressGateway, false, "")
+
+	err := validateConfigMap(cmd, map[string]interface{}{
+		"egress-gateway-ha-redirect": "true",
+	})
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "egress-gateway-ha-redirect")
+	require.ErrorContains(t, err, "was removed")
 }

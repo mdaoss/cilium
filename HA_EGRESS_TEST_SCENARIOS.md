@@ -92,8 +92,8 @@ sshpass -p rke ssh rke@<GW0> \
 | 4 | Multiple Policy Pairs | [§4](#scenario-4-multiple-policy-pairs) |
 | 5 | Asymmetric Failover | [§5](#scenario-5-asymmetric-failover) |
 | 6 | Live Failover | [§6](#scenario-6-live-failover) |
-| 7 | Non-Gateway Worker Redirect | [§7](#scenario-7-non-gateway-worker-redirect) |
-| 8 | All-in-One Stress Test | [§8](#scenario-8-all-in-one-stress-test) |
+| 7 | Removed: Worker Redirect | [§7](#scenario-7-removed-worker-redirect-path) |
+| 8 | Gateway-Only Stress Test | [§8](#scenario-8-gateway-only-stress-test) |
 | 9 | Gateway Failure + Recovery Under Load | [§9](#scenario-9-gateway-failure--recovery-under-load) |
 | 10 | Widened SNAT Port Range | [§10](#scenario-10-widened-snat-port-range--failurerecovery-at-500-rps) |
 | 11 | HTTP/2 Multiplexed — Failure/Recovery | [§11](#scenario-11-http2-multiplexed--failurerecovery-at-500-rps) |
@@ -106,8 +106,10 @@ Scenarios 1–3 follow the same structure:
 5. Cleanup — revert config if moving to next scenario
 
 Scenarios 4–6 are functional tests that can be run on any tunnel/LB mode.
-Scenarios 7–8 require the `egress-gateway-ha-redirect` config option.
-Scenarios 9–10 test gateway failure detection and recovery (requires HA redirect).
+Scenario 7 documents the removal of the old worker-side reply interception path.
+Scenario 8 is a gateway-only stress test in Geneve + DSR mode.
+Scenarios 9–10 test gateway failure detection and recovery after the external
+reply path has converged to a live gateway.
 Scenario 11 tests HTTP/2 multiplexed traffic through failure/recovery cycles.
 
 ---
@@ -120,7 +122,7 @@ This is the default configuration.
 
 ```bash
 kubectl patch configmap cilium-config -n <CILIUM_NS> --type merge \
-  -p '{"data":{"tunnel-protocol":"vxlan","loadbalancer-mode":"snat","egress-gateway-ha-redirect":"false"}}'
+  -p '{"data":{"tunnel-protocol":"vxlan","loadbalancer-mode":"snat"}}'
 
 kubectl rollout restart daemonset cilium -n <CILIUM_NS>
 kubectl rollout status daemonset cilium -n <CILIUM_NS> --timeout=120s
@@ -538,83 +540,29 @@ transient route changes must not cause failures.
 
 ---
 
-## Scenario 7: Non-Gateway Worker Redirect
+## Scenario 7: Removed Worker Redirect Path
 
-This test verifies the `egress-gateway-ha-redirect` feature, which enables any
-node in the cluster (not just gateways) to accept reply traffic for egress
-connections and redirect it via tunnel to the appropriate gateway. This is
-similar to `externalTrafficPolicy: Cluster` for LoadBalancer services.
+The previous worker-side reply interception path has been removed. Reply
+traffic for HA egress connections must now reach one of the two gateway nodes
+directly. Routes that send replies to a non-gateway worker are expected to
+fail because the worker no longer tunnels those packets to a gateway.
 
-### 7.1 Enable the Feature
-
-```bash
-kubectl patch configmap cilium-config -n <CILIUM_NS> --type merge \
-  -p '{"data":{"egress-gateway-ha-redirect":"true"}}'
-
-kubectl rollout restart daemonset cilium -n <CILIUM_NS>
-kubectl rollout status daemonset cilium -n <CILIUM_NS> --timeout=120s
-```
-
-Wait ~40s for gateway recovery (see [Prerequisites](#important-gateway-recovery-after-restart)).
-
-### 7.2 Validate
-
-Verify the BPF define is active on the **worker** node (non-gateway):
-
-```bash
-sshpass -p rke ssh rke@<WORKER> \
-  "sudo docker exec \$(sudo docker ps -q --filter name=cilium-agent) \
-    cat /var/run/cilium/state/globals/node_config.h" | grep EGRESS_GATEWAY
-# Expected: ENABLE_EGRESS_GATEWAY 1
-#           ENABLE_EGRESS_GATEWAY_HA_REDIRECT 1
-```
-
-Verify the reverse map is populated on the worker:
-
-```bash
-sshpass -p rke ssh rke@<WORKER> \
-  "sudo docker exec \$(sudo docker ps -q --filter name=cilium-agent) \
-    bpftool map dump pinned /sys/fs/bpf/tc/globals/cilium_egress_gw_reverse4"
-# Expected: entries for each egress IP → (gw0, gw1)
-```
-
-### 7.3 Test — Replies via Worker Node
-
-On the external server, force all replies through the worker (non-gateway):
-
-```bash
-sudo ip route replace 100.64.0.200/32 via 100.64.0.131
-```
-
-Run the Go client (server must already be running on 100.64.0.129):
-
-```bash
-sshpass -p rke ssh rke@100.64.0.131 \
-  "sudo nsenter --net -t <POD_PID> /tmp/client -server 100.64.0.129:9999 -total 200 -parallel 100"
-```
-
-**Pass criteria:** 200 OK, 0 FAIL.
-
-### 7.4 Restore
-
-```bash
-sudo ip route replace 100.64.0.200/32 \
-  nexthop via 100.64.0.128 nexthop via 100.64.0.130
-```
+Use Scenarios 5, 6, and 8 to validate the remaining HA behavior: asymmetric
+reply steering between gateways, route changes across gateways, and gateway-only
+stress under Geneve + DSR.
 
 ---
 
-## Scenario 8: All-in-One Stress Test
+## Scenario 8: Gateway-Only Stress Test
 
-This is the ultimate validation: Geneve + DSR mode, multiple egress policies,
-10K connections at high parallelism, with routes rotating every second across
-all nodes including the non-gateway worker. It exercises every HA code path
-simultaneously.
+This is the gateway-only stress validation: Geneve + DSR mode, multiple egress
+policies, 10K connections at high parallelism, with routes rotating every
+second across the two gateway nodes. It exercises the active/active HA paths
+without relying on any worker-side interception.
 
 ### 8.1 Prerequisites
 
 - Geneve + DSR mode configured (see [§3.1](#31-configure))
-- HA redirect enabled (see [§7.1](#71-enable-the-feature))
 - Two egress policies active (see [§4.1](#41-setup))
 - ECMP routes for both egress IPs on external server
 
@@ -628,14 +576,11 @@ Save this on the external server and run in a separate terminal:
 # Ctrl+C restores ECMP
 
 routes=(
-  "via 100.64.0.131"                                                            # worker only
-  "via 100.64.0.128"                                                            # gw0 only
-  "via 100.64.0.130"                                                            # gw1 only
-  "nexthop via 100.64.0.128 nexthop via 100.64.0.130"                           # ECMP gateways
-  "nexthop via 100.64.0.128 nexthop via 100.64.0.130 nexthop via 100.64.0.131"  # ECMP all 3
-  "via 100.64.0.131"                                                            # worker only
-  "nexthop via 100.64.0.131 nexthop via 100.64.0.128"                           # worker + gw0
-  "nexthop via 100.64.0.131 nexthop via 100.64.0.130"                           # worker + gw1
+  "via 100.64.0.128"                                  # gw0 only
+  "via 100.64.0.130"                                  # gw1 only
+  "nexthop via 100.64.0.128 nexthop via 100.64.0.130" # ECMP gateways
+  "via 100.64.0.130"                                  # gw1 only
+  "via 100.64.0.128"                                  # gw0 only
 )
 
 trap 'echo "Restoring ECMP..."; \
@@ -682,18 +627,14 @@ simultaneously because routes rotate every second:
 
 | Route State | Code Path Exercised |
 |-------------|---------------------|
-| Worker only | from-netdev redirect → tunnel → gateway overlay → reverse SNAT → pod |
 | gw0 only | Direct reverse SNAT on gw0; gw1-owned connections redirected via overlay cross-gateway tunnel |
 | gw1 only | Direct reverse SNAT on gw1; gw0-owned connections redirected via overlay cross-gateway tunnel |
 | ECMP gateways | Normal active/active load balancing |
-| ECMP all 3 | Mix of worker redirect + gateway direct + cross-gateway |
-| worker + gw0 | Worker redirects to gw0; gw0 handles directly or cross-redirects to gw1 |
-| worker + gw1 | Worker redirects to gw0; gw1 handles directly or cross-redirects to gw0 |
 
 ### 8.5 Pass Criteria
 
 **10000 OK, 0 FAIL.** No connection should fail regardless of which node
-receives the reply or how often routes change.
+gateway receives the reply or how often routes change.
 
 ---
 
@@ -703,19 +644,25 @@ This test exercises the complete gateway failure and recovery lifecycle under
 sustained load: prober detects the failure (~3s), policy map switches to
 single-gateway mode, traffic continues without interruption, the gateway
 recovers (~40s prober threshold), and traffic re-balances across both gateways.
+It is a **new-flow failover** test, not a state takeover test: packets that
+are still routed to the dead next hop never enter the cluster, and long-lived
+connections owned by the dead gateway are expected to fail until the client
+reconnects.
 
 ### 9.1 Prerequisites
 
-- Geneve + DSR + HA redirect enabled (current config after §8)
+- Geneve + DSR mode configured (current config after §8)
 - Both gateways healthy and in policy map
 - Reply route forced through surviving gateway (gw0) before the kill — in
   production BGP health-checking withdraws the dead nexthop; in the test lab
-  set the route manually before the test starts
+  set the route manually before the test starts. This is required because the
+  datapath only works after the reply reaches a live gateway; it cannot
+  recover packets sent to a powered-off gateway
 
 ### 9.2 Test — Full Failure/Recovery Cycle
 
 **Step 1:** Force replies via gw0 only (so replies don't hit the gateway we're
-about to kill):
+about to kill). If you want to kill gw0 instead, first force replies via gw1:
 
 ```bash
 # On external server:
@@ -775,7 +722,9 @@ sshpass -p rke ssh rke@<GW1> \
 
 **~9000 OK, <=5 FAIL.** A handful of failures during the ~3s detection window
 and the recovery transition are acceptable. After recovery, both gateways
-should have steering entries showing traffic was re-balanced.
+should have steering entries showing traffic was re-balanced. If failures
+continue after the detection window, the usual cause is that the external
+reply path is still targeting the dead gateway rather than the surviving one.
 
 ### 9.4 What This Tests
 
@@ -786,6 +735,13 @@ should have steering entries showing traffic was re-balanced.
 | Single-gateway | T+13 to T+110 | All traffic via gw0, `ActiveGW=1`, both IPs preserved in fixed slots |
 | Recovery | T+110 to T+120 | Prober restores gw1 after 40 consecutive probes, `ActiveGW=3` |
 | Re-balanced | T+120 to T+180 | Active/active restored, ECMP route restored |
+
+### 9.5 What This Does Not Test
+
+- It does not prove takeover of packets still routed to the dead gateway's
+  external next hop. That requires BGP/ECMP convergence outside Cilium.
+- It does not preserve long-lived connections that were owned by the dead
+  gateway. Scenario 11 covers that behavior for multiplexed HTTP/2 traffic.
 
 ---
 
@@ -798,7 +754,7 @@ SNAT allocation, reverse SNAT, steering, failover, and recovery.
 
 ### 10.1 Prerequisites
 
-- Geneve + DSR + HA redirect enabled
+- Geneve + DSR mode configured
 - Both gateways healthy and in policy map
 
 ### 10.2 Config Change — Widen SNAT Port Range
@@ -851,6 +807,17 @@ sshpass -p rke ssh rke@100.64.0.130 \
 # On external server:
 sudo ip route replace 100.64.0.200/32 via 100.64.0.128
 ```
+
+**Verify the route actually took effect** before starting the load:
+
+```bash
+# On external server:
+ip route show 100.64.0.200/32
+# Expected: 100.64.0.200 via 100.64.0.128 dev <iface>
+```
+
+If the route is absent or still shows `100.64.0.200 dev <iface>` as an on-link
+route, the pod-side preflight will fail 100%.
 
 **Step 2:** Start a sustained high-rate test (300s at 500 rps = 150K connections):
 
@@ -906,6 +873,10 @@ Failures during the ~3s detection window and recovery transition are
 acceptable. After recovery, both gateways should have steering entries in
 their respective wider port ranges (gw0: 1026–33280, gw1: 33281–65535).
 
+**Latest rerun (2026-04-06):** `149500 OK / 500 FAIL / 150000 total` (0.33% fail).
+The surviving gateway switched to `ActiveGW=1`, gw1 recovery restored `ActiveGW=3`,
+and both gateways accumulated steering entries again after ECMP was restored.
+
 ### 10.5 What This Tests
 
 | Aspect | Detail |
@@ -943,7 +914,7 @@ streams on the BPF datapath.
 
 ### 11.1 Prerequisites
 
-- Geneve + DSR + HA redirect enabled
+- Geneve + DSR mode configured
 - Widened SNAT port range (`node-port-range: "1024,1025"`) — 32255 ports/gw
 - Both gateways healthy and in policy map (`ActiveGW = 3`)
 - HTTP/2 test tools built: `cd ha_egress_gw_test && go build -o h2server ./cmd/h2server && go build -o h2client ./cmd/h2client`
@@ -1045,7 +1016,7 @@ After completing all scenarios, restore the original configuration:
 
 ```bash
 kubectl patch configmap cilium-config -n <CILIUM_NS> --type merge \
-  -p '{"data":{"tunnel-protocol":"geneve","loadbalancer-mode":"dsr","egress-gateway-ha-redirect":"true"}}'
+  -p '{"data":{"tunnel-protocol":"geneve","loadbalancer-mode":"dsr"}}'
 
 kubectl rollout restart daemonset cilium -n <CILIUM_NS>
 kubectl rollout status daemonset cilium -n <CILIUM_NS> --timeout=120s
@@ -1103,9 +1074,9 @@ See [HA_EGRESS_TROUBLESHOOTING_GUIDE.md](HA_EGRESS_TROUBLESHOOTING_GUIDE.md) for
 | 5a | Asymmetric failover (replies via gw1) | 200/200 | 2026-03-16 |
 | 5b | Asymmetric failover (replies via gw0) | 200/200 | 2026-03-16 |
 | 6 | Live failover (30s at 50 rps, route rotation) | 1500/1500 | 2026-03-16 |
-| 7 | Worker redirect (replies via non-gateway) | 200/200 | 2026-03-16 |
-| 8 | All-in-one 10K (Geneve+DSR, 2 policies, rotating routes) | 10000/10000 | 2026-03-16 |
+| 7 | Removed worker redirect path | N/A | 2026-04-06 |
+| 8 | Gateway-only 10K (Geneve+DSR, 2 policies, rotating routes) | 10000/10000 | 2026-03-16 |
 | 9 | Gateway failure + recovery, no ECMP, 100rps 300s (c029) | 29864/30000 (136 fail, 0.45%) | 2026-03-17 |
-| 10 | Widened SNAT range (32255/gw), failure+recovery, 500rps 300s | 150000/150000 (0 fail, 0%) | 2026-03-19 |
+| 10 | Widened SNAT range (32255/gw), failure+recovery, 500rps 300s | 149500/150000 (500 fail, 0.33%) | 2026-04-06 |
 | 11a | HTTP/2 multiplexed (32255/gw), kill gw1+recovery, 500rps 300s | 149499/150000 (501 fail, 0.33%) | 2026-03-19 |
 | 11b | HTTP/2 multiplexed (32255/gw), kill gw0+recovery, 500rps 300s | 149364/150000 (636 fail, 0.42%) | 2026-03-19 |

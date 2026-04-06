@@ -60,28 +60,6 @@ gateway = no asymmetry). With 2-way ECMP, ~50% of replies take this path.
 
 ---
 
-## Reply Path — Worker Redirect (HA Redirect Feature)
-
-Requires `egress-gateway-ha-redirect: "true"` in cilium config. Allows any
-node (not just gateways) to accept reply traffic for egress connections.
-
-| Step | Vanilla | HA Redirect | Overhead |
-|------|---------|-------------|----------|
-| Reverse map lookup on worker | N/A | `map_lookup_elem()` (4-byte key) | +1 map read |
-| Tunnel encap to gateway | N/A | `__encap_and_redirect_with_nodeid()` | Full tunnel hop |
-| Overlay receive on gateway | N/A | Reverse map check + tail call | +1 map read + tail call |
-| Reverse SNAT on gateway | N/A | `snat_v4_rev_nat()` | Same cost |
-| Cross-gateway redirect (50%) | N/A | Second tunnel hop | +1 more tunnel hop |
-
-**Estimated overhead:** ~10–30us — 1 or 2 tunnel hops. This path does not
-exist in vanilla at all. Worst case is 2 hops: worker → wrong gateway →
-correct gateway.
-
-**Code:** `bpf/bpf_host.c:731-758` (from-netdev intercept),
-`bpf/bpf_overlay.c:509-535` (cross-gateway redirect on NAT miss).
-
----
-
 ## Memory Overhead
 
 | Map | Type | Max Entries | Entry Size | Total |
@@ -103,7 +81,6 @@ the cilium configmap (default 65536).
 | Outbound (after SNAT) | 0 | ~30 (conditional + key build + map write) |
 | Reply (owner, common case) | 0 | ~40 (key build + map read + endpoint check) |
 | Reply (non-owner) | N/A | ~60 + tunnel encap |
-| Worker redirect | N/A | ~20 (map read) + tunnel encap |
 
 ---
 
@@ -114,7 +91,6 @@ the cilium configmap (default 65536).
 | Outbound latency | +50–100ns | Every egress TCP/UDP packet |
 | Reply latency (owner) | +30–80ns | Replies at correct gateway (~50% with ECMP) |
 | Reply latency (non-owner) | +5–15us | Replies at wrong gateway (~50% with ECMP) |
-| Reply latency (worker redirect) | +10–30us | Only with `egress-gateway-ha-redirect` |
 | Memory | +1.8 MB | Per node, constant |
 | Tail call slots | +1 | ID 50 (`CILIUM_CALL_IPV4_EGW_OVERLAY_REVSNAT`) |
 
@@ -143,12 +119,7 @@ the cilium configmap (default 65536).
 5. **No extra kernel lock contention.** LRU hash maps use per-CPU buckets
    internally, so concurrent writes from different CPUs do not contend.
 
-6. **Worker redirect adds one config-gated hop.** The
-   `egress-gateway-ha-redirect` feature adds a reverse map lookup (~20ns) in
-   the from-netdev path on every incoming packet whose daddr matches an egress
-   IP. The tunnel hop is the dominant cost, not the map lookup.
-
-7. **Compared to alternatives.** The overhead of one BPF map lookup + one
+6. **Compared to alternatives.** The overhead of one BPF map lookup + one
    tunnel hop per asymmetric reply is comparable to what `kube-proxy` iptables
    does for `externalTrafficPolicy: Cluster` (DNAT + conntrack + forward),
    but entirely in eBPF with no iptables rules.

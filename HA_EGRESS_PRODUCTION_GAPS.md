@@ -3,10 +3,9 @@
 Status: **Validated on real cluster. Some gaps remain before production.**
 
 Phases 1–4 implement the full data-plane logic (forward path hashing, port
-partitioning, steering map population, reply steering, fallback). The HA
-redirect feature adds non-gateway node reply interception. All paths have been
-validated on a real multi-node cluster with 10K+ connections and rotating
-routes. Several gaps remain before deploying to production.
+partitioning, steering map population, reply steering, fallback). All paths
+have been validated on a real multi-node cluster with 10K+ connections and
+rotating routes. Several gaps remain before deploying to production.
 
 ---
 
@@ -22,10 +21,9 @@ worker) with Geneve + DSR mode:
 - Reply at owner: steering lookup finds local owner, rev SNAT succeeds
 - Reply at non-owner: steering lookup redirects via tunnel to owner
 - Fallback: cross-gateway redirect on NAT miss via overlay handler
-- HA redirect: non-gateway worker intercepts and forwards replies
 - Multi-policy: two egress IPs tested simultaneously
 - 10K connection stress test with rotating routes: 0 failures
-- 150K TCP connection failure/recovery cycle at 500 rps: 0 failures (widened port range)
+- 150K TCP connection failure/recovery cycle at 500 rps: 0.33% failures on latest widened-port rerun
 - 150K HTTP/2 multiplexed failure/recovery at 500 rps: <0.5% failures (both gw kill directions)
 
 ### ~~2. No Integration / Connectivity Tests~~ — RESOLVED
@@ -38,8 +36,8 @@ Reply → arrives at GW1 (ECMP) → steering lookup → tunnel to GW0
 GW0 → rev SNAT → tunnel to pod's node → Pod A receives reply
 ```
 
-Additionally tested: replies via non-gateway worker (HA redirect), live failover
-with route rotation across all nodes, and multi-policy pairs.
+Additionally tested: live failover with route rotation across gateways, and
+multi-policy pairs.
 
 See [HA_EGRESS_TEST_SCENARIOS.md](HA_EGRESS_TEST_SCENARIOS.md) for reproducible
 test procedures.

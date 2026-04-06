@@ -235,16 +235,18 @@ entries after recovery.
 | Scenario 9 run 1 | 100 | 30,000 | 30000 OK, 0 fail |
 | Scenario 9 run 2 | 100 | 30,000 | 30000 OK, 0 fail |
 | Scenario 9 run 3 | 500 | 150,000 | 150000 OK, 0 fail |
-| Scenario 10 (widened range, TCP) | 500 | 150,000 | 150000 OK, 0 fail |
+| Scenario 10 (widened range, TCP) | 500 | 150,000 | 149500 OK, 500 fail (0.33%) |
 | Scenario 11a (HTTP/2, kill gw1) | 500 | 150,000 | 149499 OK, 501 fail (0.33%) |
 | Scenario 11b (HTTP/2, kill gw0) | 500 | 150,000 | 149364 OK, 636 fail (0.42%) |
 
-All TCP runs included a full failure/recovery cycle (VM shutdown + power-on)
-with zero connection failures. HTTP/2 failures are from multiplexed streams
-on connections routed through the killed gateway — expected behavior since
-long-lived HTTP/2 connections cannot survive gateway death, but the client
-reconnects immediately through the surviving gateway. Compared to 0.1–1.2%
-failure rates in the previous implementation (c029).
+Scenario 9 TCP runs completed with zero failures. The latest Scenario 10 TCP
+rerun completed with 500 failures (0.33%) during the recovery transition,
+which is still within the scenario's `<0.5%` pass threshold. HTTP/2 failures
+are from multiplexed streams on connections routed through the killed gateway —
+expected behavior since long-lived HTTP/2 connections cannot survive gateway
+death, but the client reconnects immediately through the surviving gateway.
+Compared to 0.1–1.2% failure rates in the previous implementation (c029),
+the widened-range design still behaves within the expected recovery envelope.
 
 **Previous observations (c029, before fix):**
 

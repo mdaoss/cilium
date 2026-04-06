@@ -188,17 +188,6 @@ func (config *PolicyConfig) regenerateGatewayConfig(manager *Manager) {
 		}
 	}
 
-	// On non-gateway nodes, deriveFromPolicyGatewayConfig is not called,
-	// so egressIP stays unset (0.0.0.0). If the policy spec has an egress
-	// IP, propagate it so the reverse map gets populated on all nodes.
-	// This is needed for the HA redirect feature where non-gateway nodes
-	// intercept reply traffic and need the reverse map to redirect it.
-	if !gwc.egressIP.IsValid() || gwc.egressIP == EgressIPNotFoundIPv4 {
-		if policyGwc.egressIP.IsValid() {
-			gwc.egressIP = policyGwc.egressIP
-		}
-	}
-
 	config.gatewayConfig = gwc
 }
 

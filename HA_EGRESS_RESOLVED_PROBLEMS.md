@@ -72,33 +72,6 @@ field order optimized to minimize padding.
 
 ---
 
-## 5. Non-Gateway Nodes Need Egress IP for Reverse Map
-
-**Symptom:** After enabling `egress-gateway-ha-redirect`, non-gateway worker
-nodes have an empty `cilium_egress_gw_reverse4` map. HA redirect does not work
-— replies arriving at the worker pass through unintercepted.
-
-**Root cause:** `deriveFromPolicyGatewayConfig()` is only called on gateway
-nodes (where `node.IsLocal()` matches the policy's `nodeSelector`). On
-non-gateway nodes, `gwc.egressIP` stays at `0.0.0.0`, and
-`reconcileReverseMap()` skips entries with invalid egress IPs.
-
-**Fix:** In `regenerateGatewayConfig()` (`pkg/egressgateway/policy.go`), after
-the gateway node loop, propagate the egress IP from the policy spec to
-non-gateway nodes:
-
-```go
-if !gwc.egressIP.IsValid() || gwc.egressIP == EgressIPNotFoundIPv4 {
-    if policyGwc.egressIP.IsValid() {
-        gwc.egressIP = policyGwc.egressIP
-    }
-}
-```
-
-This ensures `reconcileReverseMap()` has the egress IP on every node.
-
----
-
 ## 7. Gateway Node Failure Does Not Update Policy Map
 
 **Status: RESOLVED — gateway health prober handles failover**

@@ -158,7 +158,8 @@ type Manager struct {
 	// policyMap communicates the active policies to the datapath.
 	policyMap egressmap.PolicyMap
 
-	// reverseMap maps egress IPs to their gateway pairs for HA reply steering.
+	// reverseMap maps egress IPs to their gateway pairs for HA reply steering
+	// and overlay fallback between the two gateways.
 	reverseMap egressmap.ReverseMap
 
 	// steerMap is the HA steering map used to direct reply traffic to the
@@ -265,10 +266,6 @@ func NewEgressGatewayManager(p Params) (out struct {
 
 	out.NodeDefines = map[string]string{
 		"ENABLE_EGRESS_GATEWAY": "1",
-	}
-
-	if dcfg.EnableEgressGatewayHARedirect {
-		out.NodeDefines["ENABLE_EGRESS_GATEWAY_HA_REDIRECT"] = "1"
 	}
 
 	out.EnablerOut = tunnel.NewEnabler(true)
@@ -963,7 +960,7 @@ func (manager *Manager) removeUnusedEgressRules() {
 }
 
 // reconcileReverseMap populates the reverse lookup map (egress_ip → gw0, gw1)
-// used by the BPF datapath to redirect reply traffic on non-owner gateways.
+// used by the BPF datapath for reply steering fallback between gateways.
 func (manager *Manager) reconcileReverseMap() {
 	if manager.reverseMap == nil {
 		return

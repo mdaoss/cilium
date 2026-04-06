@@ -51,7 +51,6 @@ Today each `CiliumEgressGatewayPolicy` maps to a single active gateway node. The
 - **Fallback**: if steering entry evicted, redirect to other gateway after rev SNAT failure
 - **Reverse map** (`cilium_egress_gw_reverse4`) maps `egress_ip → (gw0, gw1)` for overlay cross-gateway redirect
 - **Overlay reverse SNAT** handler: tail call from overlay for reply traffic reverse SNAT on the gateway
-- **HA redirect** (optional): non-gateway nodes intercept reply traffic and tunnel to a gateway
 - **Gateway health probing**: TCP probes to remote gateway nodes detect failures and update policy maps
 
 ---
@@ -145,7 +144,7 @@ swapping src↔dst from the post-SNAT packet.
 
 A small hash map mapping each egress IP to the pair of gateways that serve it.
 Used by the overlay reverse SNAT handler to cross-redirect when a reply arrives
-at the wrong gateway, and by the HA redirect feature on non-gateway nodes.
+at the wrong gateway.
 
 **BPF structs** (`bpf/lib/common.h`):
 
@@ -274,7 +273,7 @@ External → gateway node (either one, due to ECMP/BGP)
 
 ### 3.3 Overlay Reverse SNAT Path
 
-When a reply is redirected via tunnel (either from steering or from HA redirect),
+When a reply is redirected via tunnel,
 it arrives at the gateway's overlay interface. A dedicated tail call handles
 reverse SNAT on the overlay:
 
@@ -286,8 +285,8 @@ Reply arrives via overlay tunnel on gateway
       → DROP_NAT_NO_MAPPING:
         → Reverse map lookup: find the OTHER gateway
         → __encap_and_redirect_with_nodeid() to peer gateway → DONE
-        (Cross-gateway redirect handles the case where HA redirect
-         or steering sent the reply to the wrong gateway of the pair)
+        (Cross-gateway redirect handles the case where steering sent
+         the reply to the wrong gateway of the pair)
 ```
 
 **Code:** `bpf/bpf_overlay.c` — `tail_handle_egw_overlay_revsnat()` is
@@ -297,32 +296,7 @@ The cross-gateway redirect on `DROP_NAT_NO_MAPPING` uses `cilium_egress_gw_rever
 to determine the peer: if `gateway_ip_0 == IPV4_DIRECT_ROUTING` (this node),
 redirect to `gateway_ip_1`, and vice versa.
 
-### 3.4 HA Redirect Path (Non-Gateway Nodes)
-
-When `egress-gateway-ha-redirect: "true"` is set in cilium config, non-gateway
-nodes can intercept incoming reply traffic destined for an egress IP and
-redirect it to a gateway via tunnel. This provides `externalTrafficPolicy:
-Cluster`-like behavior for egress gateway replies.
-
-```
-Reply arrives at non-gateway worker node → from-netdev
-  → handle_ipv4_cont()
-    → Reverse map lookup: rkey.egress_ip = ip4->daddr
-    → If match AND node is NOT a gateway (neither gw0 nor gw1):
-      → __encap_and_redirect_with_nodeid() to gateway_ip_0 → DONE
-    → If node IS a gateway: fall through to normal egress GW processing
-    → If no match: fall through (not an egress reply)
-```
-
-**Code:** `bpf/bpf_host.c` in `handle_ipv4_cont()`, guarded by
-`#ifdef ENABLE_EGRESS_GATEWAY_HA_REDIRECT`. The node identity check uses
-`IPV4_DIRECT_ROUTING` (the per-node BPF define equal to the node's K8s
-internal IP) compared against both `rval->gateway_ip_0` and `rval->gateway_ip_1`.
-
-**Config:** Enabled via `egress-gateway-ha-redirect: "true"` in the cilium
-configmap. Emits `ENABLE_EGRESS_GATEWAY_HA_REDIRECT` BPF define.
-
-### 3.5 Gateway Health Probing
+### 3.4 Gateway Health Probing
 
 When a gateway node fails (e.g., VM crash, hard shutdown), the Kubernetes Node
 object transitions to `NotReady` but the `CiliumNode` CR persists. Since the
@@ -496,7 +470,6 @@ and tunnels the reply there.
 | Reply at owner, LRU evicted | Not found | Succeeds | Normal path (steering miss is harmless) |
 | Reply at non-owner, LRU evicted | Not found | Fails | `egress_gw_reply_steer_fallback` → tunnel to other GW |
 | Reply, single gateway | Not found | Succeeds | Normal path (no HA active) |
-| Reply at non-gateway worker (HA redirect) | N/A | N/A | Reverse map hit → tunnel to gw0 → overlay rev SNAT |
 | Reply at wrong gw via overlay | N/A | Fails | Cross-gw redirect via reverse map → tunnel to peer |
 | Non-EGW reply | N/A | N/A | Passes through unchanged |
 
@@ -594,7 +567,6 @@ steering map insertion.
 | `bpf/lib/nat.h` | Phase 1–2 | `ipv4_nat_target` HA fields, fixed port range via `IPV4_DIRECT_ROUTING` in `snat_v4_needs_masquerade()` |
 | `bpf/lib/nodeport.h` | Phase 1–2, 3 | Steering map population after SNAT, reply steer before rev SNAT, fallback after failure |
 | `bpf/bpf_overlay.c` | Phase 1–2, 3+ | Updated `egress_gw_snat_needed_hook()` call; `tail_handle_egw_overlay_revsnat()` with cross-gw redirect |
-| `bpf/bpf_host.c` | HA redirect | `handle_ipv4_cont()` reverse map intercept for non-gateway nodes |
 | `bpf/bpf_alignchecker.c` | Phase 1–2 | Added steer and reverse struct types |
 | `bpf/tests/lib/egressgw_policy.h` | Phase 1–2 | Updated test helper for new struct |
 
@@ -605,10 +577,9 @@ steering map insertion.
 | `pkg/maps/egressmap/policy.go` | Phase 1–2 | Two-gateway value struct, updated interfaces |
 | `pkg/maps/egressmap/steer.go` | Phase 1–2, 4 | New: steering map types, interface, Cell provider, `OpenPinnedSteerMap()`, `Update()` |
 | `pkg/maps/egressmap/egress.go` | Phase 1–2 | Steering map Cell provider |
-| `pkg/egressgateway/policy.go` | Phase 1–2, HA redirect, prober | `gatewayIP1`, `regenerateGatewayConfig` picks 2 nodes (skips unhealthy), egress IP propagation to non-gateway nodes |
-| `pkg/option/config.go` | HA redirect | `EnableEgressGatewayHARedirect` config option |
+| `pkg/egressgateway/policy.go` | Phase 1–2, prober | `gatewayIP1`, `regenerateGatewayConfig` picks 2 nodes (skips unhealthy) |
 | `pkg/egressgateway/gateway_prober.go` | Prober | **New file.** TCP health probing of remote gateway nodes, deadlock-safe event dispatch |
-| `pkg/egressgateway/manager.go` | Phase 1–2, HA redirect, prober | Two-gateway policy map population, `reconcileReverseMap()`, `ENABLE_EGRESS_GATEWAY_HA_REDIRECT` define, gateway prober lifecycle + health event handling, `unhealthyGateways` set, `updateProberTargets()` |
+| `pkg/egressgateway/manager.go` | Phase 1–2, prober | Two-gateway policy map population, `reconcileReverseMap()`, gateway prober lifecycle + health event handling, `unhealthyGateways` set, `updateProberTargets()` |
 | `pkg/datapath/alignchecker/alignchecker.go` | Phase 1–2 | Steer struct alignment checks |
 | `cilium-dbg/cmd/bpf_egress_list.go` | Phase 1–2 | Two-gateway column display |
 | `cilium-dbg/cmd/bpf_egress_steer.go` | Phase 4 | New: parent steer command |
@@ -663,11 +634,10 @@ already validated on a real cluster:
 - Forward path hashing, fixed per-gateway SNAT port ranges, steering map population
 - Asymmetric reply steering (both directions)
 - Live failover with route changes mid-traffic
-- HA redirect from non-gateway worker nodes
 - Cross-gateway overlay redirect on NAT miss
 - Multi-policy pairs with different egress IPs
 - 10K connection stress test with rotating routes (0 failures)
-- 150K TCP connection failure/recovery cycle at 500 rps (0 failures, widened port range)
+- 150K TCP connection failure/recovery cycle at 500 rps (<0.5% failures on latest widened-port rerun)
 - 150K HTTP/2 multiplexed failure/recovery cycle at 500 rps (<0.5% failures, both gw kill directions)
 - Virtual IP interface fallback (implemented in `deriveFromPolicyGatewayConfig`)
 - Gateway health probing with automatic policy map failover (implemented)

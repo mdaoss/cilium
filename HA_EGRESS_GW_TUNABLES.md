@@ -9,7 +9,6 @@ the HA active/active egress gateway feature.
 
 | Flag / ConfigMap Key | Type | Default | Effect |
 |----------------------|------|---------|--------|
-| `egress-gateway-ha-redirect` | bool | `false` | Enable reply-traffic interception on non-gateway (worker) nodes. Emits `ENABLE_EGRESS_GATEWAY_HA_REDIRECT` BPF define. Without this, replies must reach a gateway directly (via ECMP or single route). |
 | `egress-gateway-policy-map-max` | int | 16384 | Max entries in `cilium_egress_gw_policy_v4` LPM trie. Propagated as `EGRESS_POLICY_MAP_SIZE` BPF define. |
 | `egress-gateway-reconciliation-trigger-interval` | duration | `1s` | Min interval between egress gateway policy reconciliation runs. Controls batching of policy/node change events. |
 | `egress-gateway-probe-interval` | duration | `1s` | Interval between TCP health probes to remote gateway nodes. Set to `0` to disable probing entirely. Lower values detect failures faster but increase network overhead. |
@@ -20,7 +19,6 @@ the HA active/active egress gateway feature.
 
 ### Where defined
 
-- `pkg/option/config.go:371` — `EnableEgressGatewayHARedirect`
 - `pkg/maps/egressmap/policy.go:54,58` — `EgressGatewayPolicyMapMax`
 - `pkg/egressgateway/manager.go:78,82,86` — `EgressGatewayReconciliationTriggerInterval`
 - `pkg/egressgateway/manager.go` — `EgressGatewayProbeInterval`, `EgressGatewayProbeTimeout`, `EgressGatewayProbeRecoveryThreshold`, `EgressGatewayProbeRecoveryHoldTime`
@@ -179,13 +177,11 @@ fraction of entries deleted each scan:
 |--------|--------------|--------|
 | `ENABLE_EGRESS_GATEWAY` | `EnableIPv4EgressGateway` (agent flag) | Master gate for all egress gateway BPF code |
 | `ENABLE_EGRESS_GATEWAY_COMMON` | Auto-defined when `ENABLE_EGRESS_GATEWAY` is set | Scoped gate for code needed in `nat.h` (compiled before `egress_gateway.h`) |
-| `ENABLE_EGRESS_GATEWAY_HA_REDIRECT` | `egress-gateway-ha-redirect` flag | Enables worker-node reply interception via `bpf_host.c` |
-| `IPV4_DIRECT_ROUTING` | Per-node (agent emits node's K8s IP) | Used in HA redirect to determine if current node is a gateway |
+| `IPV4_DIRECT_ROUTING` | Per-node (agent emits node's K8s IP) | Used to determine the local gateway slot for SNAT port partitioning and reply steering |
 
 ### Where defined
 
 - `bpf/lib/common.h:52` — `ENABLE_EGRESS_GATEWAY_COMMON`
-- `pkg/egressgateway/manager.go:207` — emits `ENABLE_EGRESS_GATEWAY_HA_REDIRECT`
 - `bpf/node_config.h:250-251` — `IPV4_DIRECT_ROUTING` template
 
 ---
@@ -282,11 +278,11 @@ with 0 failures before port space filled. After exhaustion, 100% of new
 connections fail with `DROP_NAT_NO_MAPPING`. Flushing SNAT/CT maps immediately
 restores operation.
 
-**Tested (widened 32255 ports/gw)**: 150K TCP connections at 500 rps with full
-failure/recovery cycle: 0 failures. 150K HTTP/2 multiplexed requests (50
-connections, 500 rps) with failure/recovery: <0.5% failures in both gw-kill
-directions (failures are from in-flight streams on connections routed through
-the killed gateway).
+**Tested (widened 32255 ports/gw)**: latest 150K TCP failure/recovery rerun at
+500 rps completed `149500/150000` (500 fail, 0.33%). 150K HTTP/2 multiplexed
+requests (50 connections, 500 rps) with failure/recovery stayed below 0.5% in
+both gw-kill directions (failures are from in-flight streams on connections
+routed through the killed gateway).
 
 See the SNAT Port Capacity Tuning Guide below for formulas and tuning levers.
 

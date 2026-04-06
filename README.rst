@@ -28,11 +28,8 @@ Fork: Active/Active HA Egress Gateway (IPv4)
    - **Gateway health probing & recovery hold** — the control plane probes
      gateway liveness and gates re-admission to avoid traffic disruption during
      recovery.
-   - **Optional HA redirect** — non-gateway nodes can intercept reply traffic
-     and tunnel it to a gateway (``egress-gateway-ha-redirect: "true"``).
-
-   Validated at 60K concurrent TCP connections and 150K HTTP/2 requests at
-   500 rps with gateway failure/recovery, zero failures. See
+   Validated at 60K concurrent TCP connections and 150K request failure/recovery
+   runs at 500 rps, with latest reruns staying below 0.5% loss. See
    ``HA_EGRESS_GW_DESIGN.md`` for the full architecture.
 ===============
 
